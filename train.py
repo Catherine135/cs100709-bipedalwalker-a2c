@@ -827,7 +827,7 @@ def check_training_lifecycle(agent, directory):
     run_dir = root / "first"
     run_dir.mkdir()
     args = parse_args(["--num-envs", "2", "--batch-size", "4", "--steps", "6",
-                       "--eval-freq", "1", "--save-freq", "1", "--device", str(agent.device),
+                       "--eval-freq", "1", "--save-freq", "1", "--device", agent.device.type,
                        "--model-path", str(root / "submission.model")])
     checked_agent = agent_from_state(agent.__getstate__()).to(args.device)
     checked_agent.ensure_optimizers()
