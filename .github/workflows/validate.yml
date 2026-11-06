@@ -1,0 +1,43 @@
+name: Windows non-training checks
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: conda-incubator/setup-miniconda@fc2d68f6413eb2d87b895e92f8584b5b94a10167
+        with:
+          miniforge-version: latest
+          activate-environment: cs100709
+          python-version: "3.11"
+          auto-activate-base: false
+          channels: conda-forge
+          channel-priority: strict
+      - name: Install prebuilt Box2D
+        shell: pwsh
+        run: conda install -n cs100709 -c conda-forge box2d-py=2.3.8 pip -y
+      - name: Install CPU PyTorch
+        shell: pwsh
+        run: conda run -n cs100709 python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+      - name: Install remaining dependencies
+        shell: pwsh
+        run: conda run -n cs100709 python -m pip install numpy==1.26.4 gymnasium==0.29.1 pygame==2.6.1 tensorboard==2.20.0 matplotlib ipython
+      - name: Validate dependency consistency
+        shell: pwsh
+        run: conda run -n cs100709 python -m pip check
+      - name: Run checks with zero optimizer steps
+        shell: pwsh
+        run: conda run --no-capture-output -n cs100709 python -B train.py --mode check --device cpu --num-envs 8
