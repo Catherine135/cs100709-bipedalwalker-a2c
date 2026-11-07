@@ -1,4 +1,4 @@
-"""CS100709: document-based, one-step A2C for BipedalWalker HARDCORE.
+"""CS100709: document-based A2C for BipedalWalker HARDCORE.
 
 Primary source
     CS100709_Reinforcement_Learning_Project.pdf, credited to Hongtu Zhou,
@@ -6,8 +6,13 @@ Primary source
     pp. 20-22; continuous-action example: pp. 31-40.
     Adaptations: four joint actions, detached TD targets, independent evaluation,
     Windows spawn workers, terminal-observation handling, portable persistence.
-    This implements the handout's one-step variant, without reward shaping,
+    Default behavior implements the handout's one-step variant, without reward shaping,
     observation normalization, replay memory, PPO, or an entropy bonus.
+    Issue #1 adds optional bootstrapped n-step returns and gradient clipping:
+    --return-steps 8 --max-grad-norm 0.5. These are experimental extensions,
+    not proven improvements or literal copies of the handout's default update.
+    Evaluation records finish/fall/time-limit, distance and original reward terms;
+    diagnostic coordinates are never added to the policy observation or reward.
 
 Windows setup (run in a Miniconda Prompt)
     conda create -n cs100709 -c conda-forge python=3.11 box2d-py=2.3.8 pip -y
@@ -28,6 +33,7 @@ Commands (keep this file named train.py)
     python train.py --mode train --device cpu --num-envs 8 --steps 1000000
     python train.py --mode train --resume runs/RUN/checkpoint.pt --steps 2000000
     python train.py --mode eval --model-path a2c.model --eval-seeds 1 3 5 7 9 --render
+    python train.py --mode train --return-steps 8 --max-grad-norm 0.5 --log-dir runs/nstep --model-path runs/nstep/a2c.model
     tensorboard --logdir runs
 
 Modes and outputs
@@ -58,6 +64,7 @@ Compatibility references (algorithm remains based on the handout)
     https://gymnasium.farama.org/tutorials/gymnasium_basics/handling_time_limits/
     https://docs.pytorch.org/docs/2.8/generated/torch.load.html
     https://stable-baselines3.readthedocs.io/en/master/modules/a2c.html
+    https://arxiv.org/abs/1602.01783
 """
 
 
@@ -139,6 +146,36 @@ def td_targets(rewards, next_values, terminated, gamma):
     return (rewards + gamma * (~terminated.bool()).to(rewards.dtype) * next_values).detach()
 
 
+# Accumulate bounded n-step returns independently in each time-major worker stream.
+def rollout_targets(rewards, next_values, terminated, truncated, gamma, num_envs, return_steps):
+    if num_envs < 1 or return_steps < 1 or rewards.numel() % num_envs:
+        raise ValueError("Returns require complete vector steps and a positive horizon.")
+    if not (rewards.shape == next_values.shape == terminated.shape == truncated.shape):
+        raise ValueError("Return arrays must have matching shapes.")
+    with torch.no_grad():
+        r, v = (array.reshape(-1, num_envs) for array in (rewards, next_values))
+        term, trunc = (array.bool().reshape(-1, num_envs) for array in (terminated, truncated))
+        targets = torch.zeros_like(r)
+        if return_steps >= len(r):
+            tail = v[-1]
+            for index in reversed(range(len(r))):
+                bootstrap = torch.where(trunc[index], v[index], tail)
+                tail = r[index] + gamma * (~term[index]) * bootstrap
+                targets[index] = tail
+            return targets.reshape(rewards.shape)
+        for start in range(len(r)):
+            active = torch.ones(num_envs, dtype=torch.bool, device=r.device)
+            discount = 1.0
+            end = min(start + return_steps, len(r))
+            for index in range(start, end):
+                targets[start] += discount * active * r[index]
+                boundary = term[index] | trunc[index] | (index == end - 1)
+                targets[start] += discount * gamma * active * boundary * (~term[index]) * v[index]
+                active = active & ~boundary  # Never consume rewards from an autoreset episode.
+                discount *= gamma
+        return targets.reshape(rewards.shape)
+
+
 # Copy tensor trees to CPU without serializing modules, optimizers or devices.
 def cpu_tree(value):
     if isinstance(value, torch.Tensor):
@@ -165,6 +202,8 @@ class Agent:
             "gamma": float(values.get("gamma", 0.99)),
             "actor_lr": float(values.get("actor_lr", 4e-4)),
             "critic_lr": float(values.get("critic_lr", 4e-3)),
+            "return_steps": int(values.get("return_steps", 1)),
+            "max_grad_norm": float(values.get("max_grad_norm", 0.0)),
             "action_low": np.broadcast_to(values.get("action_low", -1.0), (ACTION_DIM,)).tolist(),
             "action_high": np.broadcast_to(values.get("action_high", 1.0), (ACTION_DIM,)).tolist(),
         }
@@ -175,6 +214,8 @@ class Agent:
         for key in ("actor_lr", "critic_lr"):
             if not math.isfinite(self.config[key]) or self.config[key] <= 0:
                 raise ValueError(f"{key} must be finite and positive.")
+        if self.config["return_steps"] < 1 or not math.isfinite(self.config["max_grad_norm"]) or self.config["max_grad_norm"] < 0:
+            raise ValueError("return_steps must be positive and max_grad_norm finite and nonnegative.")
         self.action_low = np.asarray(self.config["action_low"], dtype=np.float32)
         self.action_high = np.asarray(self.config["action_high"], dtype=np.float32)
         if not (np.all(self.action_low == -1) and np.all(self.action_high == 1)):
@@ -253,7 +294,13 @@ class Agent:
         if len(next_states) != size or not torch.isfinite(actions).all() or not torch.isfinite(rewards).all():
             raise ValueError("Transition arrays contain invalid values or mismatched lengths.")
         with torch.no_grad():
-            targets = td_targets(rewards, self.critic(next_states), terminated, self.config["gamma"])
+            next_values = self.critic(next_states)
+            if self.config["return_steps"] == 1:
+                targets = td_targets(rewards, next_values, terminated, self.config["gamma"])
+            else:
+                truncated = torch.as_tensor(batch["truncated"], dtype=torch.bool, device=self.device)
+                targets = rollout_targets(rewards, next_values, terminated, truncated,
+                                          self.config["gamma"], int(batch["num_envs"]), self.config["return_steps"])
         values = self.critic(states)
         advantage = targets - values
         distributions = self.actor(states)
@@ -269,6 +316,9 @@ class Agent:
             "policy/entropy": distributions.entropy().detach().sum(dim=-1).mean(),
             "policy/std": distributions.stddev.detach().mean(),
             "value/advantage": advantage.detach().mean(),
+            "value/td_abs_error": advantage.detach().abs().mean(),
+            "policy/mean_abs": distributions.mean.detach().abs().mean(),
+            "policy/action_clip_fraction": (actions.detach().abs() > 1).float().mean(),
         }
         return actor_loss, critic_loss, diagnostics
 
@@ -284,6 +334,10 @@ class Agent:
             for parameter in network.parameters():
                 if parameter.grad is None or not torch.isfinite(parameter.grad).all():
                     raise FloatingPointError("A missing or non-finite gradient was detected.")
+        for name, network in (("actor", self.actor), ("critic", self.critic)):
+            limit = self.config["max_grad_norm"] or math.inf
+            norm = nn.utils.clip_grad_norm_(network.parameters(), limit, error_if_nonfinite=True)
+            diagnostics["gradient/" + name + "_norm"] = norm.detach()
         return diagnostics
 
 
@@ -395,7 +449,62 @@ class RolloutCollector:
             self.states = np.asarray(observations, dtype=np.float32).copy()
         if not rows["states"]:
             return None, episodes
-        return {key: np.concatenate(value, axis=0) for key, value in rows.items()}, episodes
+        batch = {key: np.concatenate(value, axis=0) for key, value in rows.items()}
+        batch["num_envs"] = self.num_envs
+        return batch, episodes
+
+
+# Observe progress and reproduce the pinned environment reward without changing it.
+class WalkerDiagnostics:
+    def __init__(self, env):
+        from gymnasium.envs.box2d.bipedal_walker import (
+            MOTORS_TORQUE,
+            SCALE,
+            TERRAIN_GRASS,
+            TERRAIN_LENGTH,
+            TERRAIN_STEP,
+        )
+        self.walker = env.unwrapped
+        self.scale = SCALE
+        self.torque = MOTORS_TORQUE
+        self.finish_x = (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP
+        self.start_x = self.previous_x = self.max_x = float(self.walker.hull.position.x)
+        self.previous_angle = abs(float(self.walker.hull.angle))
+        self.terms = {"forward": 0.0, "posture": 0.0, "motor": 0.0, "terminal_adjustment": 0.0}
+        self.raw_return = 0.0
+        self.action_total = self.clipped = self.steps = 0
+
+
+    def observe(self, raw_action, action, reward):
+        x, angle = float(self.walker.hull.position.x), abs(float(self.walker.hull.angle))
+        terms = {"forward": 130 * (x - self.previous_x) / self.scale,
+                 "posture": -5 * (angle - self.previous_angle),
+                 "motor": -0.00035 * self.torque * float(np.clip(np.abs(action), 0, 1).sum(dtype=np.float64))}
+        failed = self.walker.game_over or x < 0
+        terms["terminal_adjustment"] = -100 - sum(terms.values()) if failed else 0.0
+        for key, value in terms.items():
+            self.terms[key] += value
+        self.raw_return += float(reward)
+        self.action_total += float(np.abs(action).sum())
+        self.clipped += int(np.count_nonzero(np.abs(raw_action) > 1))
+        self.steps += 1
+        self.previous_x, self.previous_angle = x, angle
+        self.max_x = max(self.max_x, x)
+
+
+    def result(self, terminated, truncated):
+        failed = bool(self.walker.game_over or self.previous_x < 0)
+        success = bool(terminated and not failed and self.previous_x > self.finish_x)
+        reason = ("fall" if self.walker.game_over else "left_boundary" if self.previous_x < 0
+                  else "finish" if success else "time_limit" if truncated else "other_termination")
+        return {"terminated": bool(terminated), "truncated": bool(truncated), "success": success,
+                "end_reason": reason, "x_displacement": self.previous_x - self.start_x,
+                "max_x_displacement": self.max_x - self.start_x,
+                "progress_fraction": (self.max_x - self.start_x) / (self.finish_x - self.start_x),
+                "action_clip_fraction": self.clipped / (ACTION_DIM * max(1, self.steps)),
+                "mean_abs_action": self.action_total / (ACTION_DIM * max(1, self.steps)),
+                "reward_terms": self.terms.copy(),
+                "reward_reconstruction_error": self.raw_return - sum(self.terms.values())}
 
 
 # Evaluate complete episodes using the original, undiscounted environment reward.
@@ -403,7 +512,7 @@ def evaluate_agent(agent, seeds, render=False, env=None):
     owned = env is None
     env = make_env("rgb_array" if render else None) if owned else env
     figure = None
-    rewards, lengths = [], []
+    rewards, lengths, diagnostics = [], [], []
     try:
         if render:
             import matplotlib.pyplot as plt
@@ -412,10 +521,13 @@ def evaluate_agent(agent, seeds, render=False, env=None):
             artist = None
         for seed in seeds:
             state, _ = env.reset(seed=int(seed))
+            tracker = WalkerDiagnostics(env)
             total = 0.0
             for step in range(1, EPISODE_LIMIT + 1):
-                action = agent.select_action(state, eval=True)
+                raw, executed = agent.sample_actions(np.asarray(state)[None, :], deterministic=True)
+                action = executed[0]
                 state, reward, terminated, truncated, _ = env.step(action)
+                tracker.observe(raw[0], action, reward)
                 total += float(reward)
                 if render:
                     frame = env.render()
@@ -432,13 +544,16 @@ def evaluate_agent(agent, seeds, render=False, env=None):
                 raise RuntimeError("Evaluation exceeded the course environment's time limit.")
             rewards.append(total)
             lengths.append(step)
+            diagnostics.append(tracker.result(terminated, truncated))
     finally:
         if owned:
             env.close()
         if figure is not None:
             plt.close(figure)
     return {"seeds": list(seeds), "rewards": rewards, "lengths": lengths,
-            "mean_reward": float(np.mean(rewards)), "std_reward": float(np.std(rewards))}
+            "mean_reward": float(np.mean(rewards)), "std_reward": float(np.std(rewards)),
+            "diagnostics": diagnostics,
+            "success_rate": float(np.mean([item["success"] for item in diagnostics]))}
 
 
 # Save atomically after closing the temporary file, including on Windows.
@@ -546,6 +661,10 @@ class TrainManager:
         result["episodes"] = self.episodes
         for key in ("mean_reward", "std_reward"):
             self.writer.add_scalar("evaluation/" + key, result[key], self.steps)
+        if "diagnostics" in result:
+            self.writer.add_scalar("evaluation/success_rate", result["success_rate"], self.steps)
+            for key in ("progress_fraction", "action_clip_fraction", "mean_abs_action"):
+                self.writer.add_scalar("evaluation/" + key, np.mean([row[key] for row in result["diagnostics"]]), self.steps)
         with (self.run_dir / "evaluations.jsonl").open("a", encoding="utf-8") as output:
             output.write(json.dumps(result, allow_nan=False) + "\n")
         print(f"Evaluation at {self.steps} steps: {result['rewards']} | mean {result['mean_reward']:.3f}", flush=True)
@@ -648,6 +767,9 @@ def run_training(args):
             raise ValueError("--resume must point to this script's training checkpoint.pt.")
         agent = agent_from_state(resume["agent"]).to(args.device)
         print("Restoring model hyperparameters and validation seeds from checkpoint; episodes restart.", flush=True)
+        args.return_steps = agent.config["return_steps"]
+        args.max_grad_norm = agent.config["max_grad_norm"]
+        print(f"Restored return_steps={args.return_steps}, max_grad_norm={args.max_grad_norm}; command-line overrides do not change checkpoint learning settings.", flush=True)
         args.seed = int(resume["config"]["seed"])
     else:
         probe = make_env()
@@ -740,6 +862,7 @@ class CheckVectorEnv:
 
 # Check analytical values, gradient isolation and collectors without fitting a model.
 def check_math_and_flow(agent):
+    agent = Agent({**agent.config, "device": agent.device.type, "return_steps": 1})
     rewards = torch.tensor([1.0, 2.0, 3.0])
     next_values = torch.tensor([10.0, 20.0, 30.0], requires_grad=True)
     target = td_targets(rewards, next_values, torch.tensor([False, True, False]), 0.9)
@@ -785,6 +908,72 @@ def check_math_and_flow(agent):
     assert np.all(last["next_states"][1] == 3) and last["truncated"][1]
     assert last["terminated"].sum() == 0
     print("PASS: analytical TD/losses, gradient isolation, raw actions, autoreset and partial batches.")
+
+
+# Check multistep boundaries, clipping and reward diagnostics without optimizer updates.
+def check_revision(agent):
+    from types import SimpleNamespace
+
+    rewards = torch.tensor([1., 10., 2., 20., 100., 30.], device=agent.device)
+    next_values = torch.tensor([5., 50., 6., 60., 7., 70.], device=agent.device, requires_grad=True)
+    terminated = torch.tensor([False, False, True, False, False, False], device=agent.device)
+    truncated = torch.tensor([False, False, False, True, False, False], device=agent.device)
+    target = rollout_targets(rewards, next_values, terminated, truncated, 0.5, 2, 3)
+    torch.testing.assert_close(target, torch.tensor([2., 35., 2., 50., 103.5, 65.], device=agent.device))
+    assert not target.requires_grad
+    torch.testing.assert_close(rollout_targets(rewards, next_values, terminated, truncated, 0.5, 2, 1),
+                               td_targets(rewards, next_values, terminated, 0.5))
+    torch.testing.assert_close(rollout_targets(rewards, next_values, terminated, truncated, 0.5, 2, 20), target)
+    torch.testing.assert_close(rollout_targets(rewards, next_values, terminated, truncated, 0.5, 2, 2), target)
+    no_end = torch.zeros_like(terminated)
+    shorter = rollout_targets(rewards, next_values, no_end, no_end, 0.5, 2, 2)
+    torch.testing.assert_close(shorter, torch.tensor([3.5, 35., 53.75, 52.5, 103.5, 65.], device=agent.device))
+    revised = Agent({**agent.config, "device": agent.device.type, "return_steps": 3, "max_grad_norm": 0.5})
+    before = revised.__getstate__()
+    batch, _ = RolloutCollector(CheckVectorEnv(), revised, 1).collect(6)
+    batch["rewards"] *= 10000
+    actor_loss, critic_loss, _ = revised.losses(batch)
+    actor_loss.backward()
+    assert all(p.grad is None for p in revised.critic.parameters())
+    revised.actor.zero_grad(set_to_none=True)
+    critic_loss.backward()
+    assert all(p.grad is None for p in revised.actor.parameters())
+    metrics = revised.backward_batch(batch)
+    assert any(float(metrics[f"gradient/{name}_norm"]) > 0.5 for name in ("actor", "critic"))
+    for network in (revised.actor, revised.critic):
+        norm = torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in network.parameters()]))
+        assert float(norm) <= 0.50001
+    assert_weights_equal(before, revised.__getstate__())
+
+    # Legacy exports keep the old one-step behavior when new config keys are absent.
+    legacy = agent.__getstate__()
+    for key in ("return_steps", "max_grad_norm"):
+        legacy["config"].pop(key)
+    loaded = agent_from_state(legacy)
+    assert loaded.config["return_steps"] == 1 and loaded.config["max_grad_norm"] == 0
+    assert_weights_equal(legacy, loaded.__getstate__())
+
+    # A time limit is not success; falling replaces the entire step reward with -100.
+    walker = SimpleNamespace(hull=SimpleNamespace(position=SimpleNamespace(x=5.0), angle=0.0), game_over=False)
+    tracker = WalkerDiagnostics(SimpleNamespace(unwrapped=walker))
+    walker.hull.position.x = 6.0
+    walker.hull.angle = 0.1
+    raw, action = np.full(4, 2.0), np.ones(4)
+    reward = 130 / 30 - 0.5 - 0.028 * 4
+    tracker.observe(raw, action, reward)
+    row = tracker.result(False, True)
+    assert row["end_reason"] == "time_limit" and not row["success"]
+    assert row["action_clip_fraction"] == 1 and row["x_displacement"] == 1
+    assert abs(row["reward_reconstruction_error"]) < 1e-6
+    walker.game_over = True
+    tracker.observe(raw, action, -100)
+    row = tracker.result(True, False)
+    assert row["end_reason"] == "fall" and abs(row["reward_reconstruction_error"]) < 1e-6
+    walker.game_over = False
+    walker.hull.position.x = tracker.finish_x + 1
+    tracker.observe(np.zeros(4), np.zeros(4), 130 * (walker.hull.position.x - 6) / 30)
+    assert tracker.result(True, False)["success"]
+    print("PASS: multistep terminal/truncation boundaries, partial rollouts, gradient clipping, legacy models and reward diagnostics.")
 
 
 # Verify import, serialization and the exact teacher interface in a fresh process.
@@ -924,6 +1113,7 @@ def run_checks(args):
     agent = Agent(args)
     before = agent.__getstate__()
     check_math_and_flow(agent)
+    check_revision(agent)
     state = np.zeros(STATE_DIM, dtype=np.float32)
     first = agent.select_action(state, eval=True)
     np.testing.assert_array_equal(first, agent.select_action(state, eval=True))
@@ -956,6 +1146,7 @@ def run_checks(args):
     result = evaluate_agent(agent, EXAMPLE_SEEDS)
     assert len(result["rewards"]) == 5
     assert result["mean_reward"] == sum(result["rewards"]) / len(result["rewards"])
+    assert all(abs(row["reward_reconstruction_error"]) < 1e-4 for row in result["diagnostics"])
     assert_weights_equal(before, agent.__getstate__())
     print("PASS: five complete evaluation episodes and unchanged network weights.")
     print("All checks passed. Optimizer steps: 0. No trained model was produced.")
@@ -971,6 +1162,8 @@ def parse_args(argv=None):
     parser.add_argument("--steps", type=int, default=1_000_000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--return-steps", type=int, default=1, help="A2C return horizon; 1 preserves the handout baseline.")
+    parser.add_argument("--max-grad-norm", type=float, default=0.0, help="Separate Actor/Critic gradient limit; 0 disables clipping.")
     parser.add_argument("--actor-lr", type=float, default=4e-4)
     parser.add_argument("--critic-lr", type=float, default=4e-3)
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -986,11 +1179,13 @@ def parse_args(argv=None):
     parser.add_argument("--render", action="store_true", help="Show RGB frames in evaluation mode.")
     parser.add_argument("--benchmark-seconds", type=float, default=20.0)
     args = parser.parse_args(argv)
-    for name in ("num_envs", "torch_threads", "steps", "batch_size", "hidden_dim", "eval_freq", "save_freq", "log_interval"):
+    for name in ("num_envs", "torch_threads", "steps", "batch_size", "hidden_dim", "eval_freq", "save_freq", "log_interval", "return_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
     if args.batch_size % args.num_envs or args.steps % args.num_envs:
         parser.error("--steps and --batch-size must be multiples of --num-envs.")
+    if not math.isfinite(args.max_grad_norm) or args.max_grad_norm < 0:
+        parser.error("--max-grad-norm must be finite and nonnegative.")
     if not 0 < args.gamma <= 1 or not all(math.isfinite(x) and x > 0 for x in (args.actor_lr, args.critic_lr, args.benchmark_seconds)):
         parser.error("Learning rates/benchmark duration must be positive and finite; gamma must be in (0, 1].")
     if not 0 <= args.seed < 2**32 - args.num_envs or any(seed < 0 or seed >= 2**32 for seed in args.eval_seeds + args.validation_seeds):

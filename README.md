@@ -4,6 +4,20 @@
 
 公开仓库：<https://github.com/Catherine135/cs100709-bipedalwalker-a2c>。读取、克隆和下载不需要 GitHub 登录。链接本身不会执行程序；接手 agent 必须能在目标电脑上使用终端、联网下载依赖、写入工作目录和维持长时间进程。
 
+## 本轮修订：针对 Issue #1 的对照实验
+
+[GWTower 的 Issue #1](https://github.com/Catherine135/cs100709-bipedalwalker-a2c/issues/1)报告：原版一步 A2C 训练 100 万步，最佳验证平均奖励 **−87.708**，最终五种子评测 **−87.350 ± 1.277**（跨种子标准差），均为 1600 步。这是已完成的基线，不是任务已经解决的证据。模型和检查点尚未随 issue 提供，当前无法重放它的动作；“没摔倒”“已跨越障碍”和“24 核已打满”等判断不能只由这些数字确认。
+
+本轮新增 `--return-steps 8 --max-grad-norm 0.5`，其余网络、学习率、每批 64 个样本、训练种子和 100 万步预算保持一致。多步回报在每个并行环境内累计，终止时停止自举、截断时自举末状态，不串入新回合；分别限制 Actor 和 Critic 的梯度范数。它们是待验证的 A2C 扩展，参考[原始 Actor-Critic 论文](https://arxiv.org/abs/1602.01783)和 [A2C 参数说明](https://stable-baselines3.readthedocs.io/en/master/modules/a2c.html#parameters)，不是 PDF 默认代码，也没有已经改善分数的证据。CLI 默认仍是一步、不裁剪，以保留原基线。
+
+**接到下一轮训练任务时，按下文使用新配置，从头训练独立的 100 万步实验；已有相同新配置的进度才恢复。** 不恢复旧基线并误认为新算法已生效，也不覆盖旧模型。下面的检查点扫描已区分基线与新配置。如果只评测旧模型，沿用原模型路径即可；新代码兼容旧模型和检查点。
+
+先复用 GWTower 已安装且检查通过的环境，无须重新下载 PyTorch。新配置先运行 `--mode check --return-steps 8 --max-grad-norm 0.5`；同一电脑默认继续用此前更快的 CPU，只有硬件／环境变化或用户要求时才重做 CPU／CUDA 测速。最终比较原始平均奖励、到达终点比例、前进距离和终止原因，不能只比较回合长度。一个种子的训练实验不足以证明普遍改善；尚不宣称解决 Hardcore。
+
+PDF 第 1 页要求尽量提高平均奖励并展示策略；第 2 页的“300+”描述走到远端时的奖励，不是写明的统一及格线，也不是满分上限。当前负分结果不足以展示成功完成任务。保留环境原始奖励，新增只读诊断：前进／姿态／力矩／失败覆盖调整、行进距离、`finish / fall / left_boundary / time_limit`、动作裁剪比例、成功率；坐标不输入策略，不参与修改奖励。运行预算完成与任务表现达标应分别报告。
+
+Issue 的源码 SHA-256 `88698c…` 与原版 `895d69…` 仅因 CRLF／LF 换行符不同，已核对内容一致。此处不是另一个训练实现。
+
 ## 1. 接手 agent 的执行约定
 
 当用户要求按本仓库开始训练时，按本文顺序执行到验收完成，不要只复述命令或在常规步骤前反复请求确认。若用户只要求阅读、修改代码或检查，则不因此启动训练。
@@ -12,7 +26,7 @@
 - **用户的 Mac 只用于开发和非训练验证，不在 Mac 上运行模型训练。** 如果当前系统不是 Windows，说明平台不符，不把任务默认为在 Mac 上训练。
 - 常规依赖安装、项目目录创建、检查、测速、既定预算内的训练和恢复可以直接进行。优先使用用户级环境，无需管理员安装或系统重启。CUDA 不可用时使用已验证的 CPU 路径继续。
 - 初始预算固定为累计 **1,000,000 次环境交互**，不是每个环境 100 万步。中断恢复也包含在预算中。达到预算后评测并交付，不因成绩低而无限延长训练、搜索超参数或更换算法。
-- 每次开始前检查是否已有本任务的训练进程及检查点。已有进程继续监看；已有有效检查点则恢复；已有完整结果则复核并交付。不要重复开多个训练进程或覆盖以往结果。
+- 每次开始前检查是否已有本任务的训练进程及检查点。已有进程继续监看；已有有效检查点则恢复；已有相同配置的完整结果则复核并交付；旧基线完成不等于新配置实验完成。不要重复开多个训练进程或覆盖以往结果。
 - 日志、错误及训练产物保留在本机。默认不把模型、日志或课程 PDF 上传到公开仓库。
 - 常见故障按第 8 节修复，同一原因最多重试两次。无法自行解决时报告具体错误、已保存进度及所需外部操作，不把失败当作完成。
 
@@ -27,7 +41,8 @@
 | 回合时限 | Gymnasium 0.29.1 注册的 1600 步 |
 | Actor／Critic | 两个独立网络；各两层 128 单元；Mish |
 | 策略 | 可学习标准差的高斯策略；执行时裁剪动作 |
-| 更新 | 一步时序差分（Temporal Difference，TD）；每批 64 个样本 |
+| 更新 | CLI 基线：一步时序差分（Temporal Difference，TD）；本轮：最多 8 步回报；均每批 64 个样本 |
+| 梯度裁剪 | CLI 基线关闭；本轮 Actor／Critic 分别使用范数上限 0.5 |
 | 折扣／学习率 | `gamma=0.99`；Actor `4e-4`，Critic `4e-3`；Adam |
 | 采样／线程 | 默认 8 个 `spawn` 环境；1 个 PyTorch 计算线程 |
 | 随机种子 | 训练 543；各环境使用相应偏移 |
@@ -111,7 +126,9 @@ foreach ($RlCandidate in $RlCandidates) {
 
 如果 `$RlConda` 为空，按 [Miniforge 官方 Windows 安装说明](https://github.com/conda-forge/miniforge#windows)自行下载 `Miniforge3-Windows-x86_64.exe` 及对应 `.sha256`，核对 SHA-256 后安装。选择当前用户可写、只含 ASCII 字符且无空格的专用目录，使用 `/InstallationType=JustMe /AddToPath=0 /RegisterPython=0 /S /D=<绝对安装目录>`，`/D` 放在最后。用 `Start-Process -Wait -PassThru` 检查退出码，将 `$RlConda` 设为该目录的 `Scripts\conda.exe`。不修改系统 PATH、其他 Python 或要求重启。默认用户路径不适合时自行选择其他可写目录；只有安装被系统策略阻止或没有可用目录时才报告阻塞。
 
-创建项目环境并安装固定依赖：
+以下创建／安装命令仅在没有合适环境时执行。GWTower 已完成安装时，先通过 `conda env list --json` 或既有交接记录找到环境，把 `$RlPrefix` 设为其绝对路径，定义下面两个函数后运行 `pip check` 和自检。版本匹配、自检通过就跳过所有安装命令；不要无条件创建 `.conda` 或重装 PyTorch。
+
+首次创建项目环境并安装固定依赖：
 
 ```powershell
 if (-not $RlConda) { throw 'Locate or install Miniforge before continuing.' }
@@ -147,18 +164,18 @@ Invoke-RlPython -m pip install --force-reinstall torch==2.8.0 --index-url https:
 
 ```powershell
 $RlNumEnvs = 8
-Invoke-RlPython -B train.py --mode check --device cpu --num-envs $RlNumEnvs 2>&1 | Tee-Object "$RlTaskDir\check-cpu.log"
-Invoke-RlPython -B train.py --mode benchmark --device cpu --num-envs $RlNumEnvs --benchmark-seconds 20 2>&1 | Tee-Object "$RlTaskDir\benchmark-cpu-1.log"
-Invoke-RlPython -B train.py --mode benchmark --device cpu --num-envs $RlNumEnvs --benchmark-seconds 20 2>&1 | Tee-Object "$RlTaskDir\benchmark-cpu-2.log"
+Invoke-RlPython -B train.py --mode check --device cpu --num-envs $RlNumEnvs --return-steps 8 --max-grad-norm 0.5 2>&1 | Tee-Object "$RlTaskDir\check-cpu.log"
+Invoke-RlPython -B train.py --mode benchmark --device cpu --num-envs $RlNumEnvs --benchmark-seconds 20 --return-steps 8 --max-grad-norm 0.5 2>&1 | Tee-Object "$RlTaskDir\benchmark-cpu-1.log"
+Invoke-RlPython -B train.py --mode benchmark --device cpu --num-envs $RlNumEnvs --benchmark-seconds 20 --return-steps 8 --max-grad-norm 0.5 2>&1 | Tee-Object "$RlTaskDir\benchmark-cpu-2.log"
 ```
 
 自检开头打印系统、依赖、`cuda_available` 和 GPU 名称。`cuda_available=true` 时再运行：
 
 ```powershell
 # Run only if CPU preflight reported cuda_available=true.
-Invoke-RlPython -B train.py --mode check --device cuda --num-envs $RlNumEnvs 2>&1 | Tee-Object "$RlTaskDir\check-cuda.log"
-Invoke-RlPython -B train.py --mode benchmark --device cuda --num-envs $RlNumEnvs --benchmark-seconds 20 2>&1 | Tee-Object "$RlTaskDir\benchmark-cuda-1.log"
-Invoke-RlPython -B train.py --mode benchmark --device cuda --num-envs $RlNumEnvs --benchmark-seconds 20 2>&1 | Tee-Object "$RlTaskDir\benchmark-cuda-2.log"
+Invoke-RlPython -B train.py --mode check --device cuda --num-envs $RlNumEnvs --return-steps 8 --max-grad-norm 0.5 2>&1 | Tee-Object "$RlTaskDir\check-cuda.log"
+Invoke-RlPython -B train.py --mode benchmark --device cuda --num-envs $RlNumEnvs --benchmark-seconds 20 --return-steps 8 --max-grad-norm 0.5 2>&1 | Tee-Object "$RlTaskDir\benchmark-cuda-1.log"
+Invoke-RlPython -B train.py --mode benchmark --device cuda --num-envs $RlNumEnvs --benchmark-seconds 20 --return-steps 8 --max-grad-norm 0.5 2>&1 | Tee-Object "$RlTaskDir\benchmark-cuda-2.log"
 ```
 
 每份 benchmark 输出有两个 JSON 对象：开头是环境信息，最后一个才是测速结果。从最后一个读取 `steps_per_second`，不要把整个日志直接交给 `ConvertFrom-Json`。两次结果取算术平均：**只有 CUDA 自检通过且平均速度至少比 CPU 快 10% 时选择 `cuda`，否则选 `cpu`**。这是运行选择规则，不是课程算法要求。记录两组数值、选择及理由；CUDA 不可用或失败时记录原因，继续 CPU。
@@ -169,14 +186,18 @@ Invoke-RlPython -B train.py --mode benchmark --device cuda --num-envs $RlNumEnvs
 
 检查 `runs/**/handoff.json` 中记录的进程，核对 PID 创建时间、命令和本仓库路径，避免 PID 被重用。若本任务仍在运行，继续监看并跳过启动命令。
 
-没有活跃训练时，扫描本仓库 `runs/` 的检查点，读取真正的 `steps`，不要只按修改时间选文件。下面列出默认配置下的有效候选和无法读取的文件，并选择步数最多的候选；不训练或修改权重：
+没有活跃训练时，扫描本仓库 `runs/` 的检查点，读取真正的 `steps`，不要只按修改时间选文件。下面区分本轮配置、旧基线和无法读取的检查点，并选择步数最多的候选；不训练或修改权重：
 
 ```powershell
+$RlReturnSteps = 8
+$RlMaxGradNorm = 0.5
 $RlScan = @'
 import json
+import sys
 from pathlib import Path
 import torch
-valid, skipped = [], []
+valid, skipped, baseline = [], [], []
+return_steps, max_grad_norm = int(sys.argv[1]), float(sys.argv[2])
 expected = dict(state_dim=24, n_actions=4, hidden_dim=128, gamma=0.99, actor_lr=4e-4, critic_lr=4e-3)
 for path in Path('runs').rglob('checkpoint.pt'):
     try:
@@ -187,17 +208,23 @@ for path in Path('runs').rglob('checkpoint.pt'):
         assert item['config']['seed'] == 543 and item['config']['batch_size'] == 64
         assert item['validation_seeds'] == [101, 103, 105, 107, 109]
         assert item['steps'] >= 0
+        settings = (config.get('return_steps', 1), config.get('max_grad_norm', 0.0))
+        if settings != (return_steps, max_grad_norm):
+            if settings == (1, 0.0):
+                baseline.append(dict(path=str(path.resolve()), steps=item['steps']))
+                continue
+            raise ValueError('Checkpoint learning settings differ from this experiment')
         valid.append(dict(path=str(path.resolve()), steps=item['steps'], updates=item['updates']))
     except Exception as error:
         skipped.append(dict(path=str(path.resolve()), error=repr(error)))
 valid.sort(key=lambda row: (row['steps'], row['updates'], row['path']), reverse=True)
-print(json.dumps(dict(selected=valid[0] if valid else None, candidates=valid, skipped=skipped)))
+print(json.dumps(dict(selected=valid[0] if valid else None, candidates=valid, baseline=baseline, skipped=skipped)))
 '@
-$RlScanResult = (Invoke-RlPython -c $RlScan | Out-String) | ConvertFrom-Json
+$RlScanResult = (Invoke-RlPython -c $RlScan $RlReturnSteps $RlMaxGradNorm | Out-String) | ConvertFrom-Json
 $RlScanResult | ConvertTo-Json -Depth 8 | Out-File "$RlTaskDir\checkpoint-scan.json" -Encoding utf8
 ```
 
-发现检查点但全部损坏／不兼容时，不静默从零重跑；先检查错误和其他备份。没有旧检查点才从零开始。目录很大时只扫描 `runs/`，不要扫描整个磁盘或 `.conda/`。
+只有 `baseline` 而没有本轮配置的检查点时，保留基线并开始本轮新实验。`skipped` 非空且没有有效候选时，先检查错误及备份，避免把本轮损坏的进度默默丢掉。目录很大时只扫描 `runs/`，不要扫描整个磁盘或 `.conda/`。
 
 根据测速设置设备；下面 `cpu` 是默认值，满足 CUDA 条件时由 agent 改成 `cuda`：
 
@@ -217,6 +244,7 @@ $RlTrainingLogs = Join-Path $RlTaskDir 'training'
 $RlTrainArgs = @('-u', 'train.py', '--mode', 'train', '--device', $RlDevice,
     '--num-envs', "$RlNumEnvs", '--torch-threads', '1', '--batch-size', '64',
     '--steps', "$RlTarget", '--seed', '543', '--eval-freq', '10', '--save-freq', '1',
+    '--return-steps', "$RlReturnSteps", '--max-grad-norm', "$RlMaxGradNorm",
     '--log-dir', $RlTrainingLogs, '--model-path', $RlModel)
 if ($RlResume) { $RlTrainArgs += @('--resume', $RlResume) }
 ```
@@ -241,7 +269,7 @@ agent 在启动后将实际进程／会话信息补写到 `handoff.json`，状�
 
 程序每 100 次更新打印进度；验证时采样进度暂时停止。`active_steps_per_second` 不含验证耗时，不能因一次日志间隔较长就杀掉进程。`--steps` 和 `--batch-size` 必须能被 `--num-envs` 整除。
 
-恢复时，模型超参数、训练随机种子和验证种子来自检查点；设备、环境数、批大小等运行参数来自本次命令。环境回合重新开始，不是 Box2D 世界状态的逐位连续重放。
+恢复时，包括 `return_steps` 和 `max_grad_norm` 在内的模型学习设置、训练随机种子和验证种子来自检查点，命令行不能把旧基线直接转换为新配置；设备、环境数、批大小等运行参数来自本次命令。环境回合重新开始，不是 Box2D 世界状态的逐位连续重放。
 
 ## 7. 结束后的验收和交付
 
@@ -271,7 +299,7 @@ Invoke-RlPython -c $RlLoadCheck $RlModel 2>&1 | Tee-Object "$RlTaskDir\teacher-l
 Invoke-RlPython -B train.py --mode eval --device cpu --model-path $RlModel --eval-seeds 1 3 5 7 9 2>&1 | Tee-Object "$RlTaskDir\evaluation.log"
 ```
 
-4. 将评测输出的**最后一个 JSON 对象**保存为 `evaluation.json`，包含 `seeds`、五个 `rewards`、五个 `lengths`、`mean_reward` 和 `std_reward`。确认结果有限，平均值等于五个完整回合原始总奖励的算术平均；低分／负分也如实保留。
+4. 将评测输出的**最后一个 JSON 对象**保存为 `evaluation.json`，包含 `seeds`、五个 `rewards`、五个 `lengths`、`mean_reward` 和 `std_reward`。确认结果有限，平均值等于五个完整回合原始总奖励的算术平均；低分／负分也如实保留。新版还输出 `success_rate` 和逐回合 `diagnostics`，需一并保留；检查 `reward_reconstruction_error` 的绝对值小于 `1e-4`。`progress_fraction` 表示从起点到终点的最大前进比例；`time_limit` 不是成功。
 5. 从 TensorBoard 事件文件导出训练回合奖励、验证平均奖励两张 PNG 曲线，横轴使用累计环境步数。恢复过训练时合并续训和所引用检查点的来源运行，标明恢复边界；缺少旧事件文件则说明图覆盖范围。平滑线可以辅助展示，但保留原始数据。
 6. 在 `$RlTaskDir\submission\` 放入**本次实际训练所用的** `train.py` 和最佳 `a2c.model`，记录 SHA-256，压缩为 `$RlTaskDir\submission.zip`。提交包不含环境、临时文件或检查点；检查点和完整日志单独保留。
 7. 生成 `$RlTaskDir\RESULTS.md`，将 `handoff.json` 更新为 `completed`，向用户报告结果与绝对路径，不自动向 GitHub 推送产物。
@@ -323,5 +351,7 @@ action = agent.select_action(state, eval=True)
 `torch.save(agent, ...)` 保存完整 `Agent` 对象，其持久化状态只含 CPU 张量和基本类型。导入 `train` 时仅注册本文件的 `Agent`，兼容 PyTorch 2.6 起默认受限载入。评测使用策略均值，返回 `(4,)` 的 `float32` NumPy 数组；`eval=False` 返回原始动作和执行动作。
 
 内置检查覆盖手算 TD／损失、梯度隔离、动作接口、自动重置、剩余批次、真实 Box2D 渲染、8 个 spawn 工作进程、独立进程的教师载入、五个完整评测回合、TensorBoard、恢复和中断保存。本机和 [Windows CPU 检查](https://github.com/Catherine135/cs100709-bipedalwalker-a2c/actions/runs/42240555441)已通过。流程检查使用模拟更新，禁止优化器 `step()`，不证明训练收敛；RTX 4080 验证由接手 agent 在目标电脑完成。
+
+新版 TensorBoard 增加 `gradient/actor_norm`、`gradient/critic_norm`（裁剪前范数）、`value/td_abs_error`、`policy/mean_abs`、`policy/action_clip_fraction` 和评测成功率／距离比例等指标。诊断用于检验原因，不能在缺少测量时声称旧训练存在梯度爆炸或动作饱和。
 
 兼容性依据：[Gymnasium 注册源码](https://github.com/Farama-Foundation/Gymnasium/blob/v0.29.1/gymnasium/envs/__init__.py)、[时间限制处理](https://gymnasium.farama.org/tutorials/gymnasium_basics/handling_time_limits/)、[PyTorch 模型载入](https://docs.pytorch.org/docs/2.8/generated/torch.load.html)、[A2C CPU 建议](https://stable-baselines3.readthedocs.io/en/master/modules/a2c.html)。算法依据仍是课程文件。

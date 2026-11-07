@@ -9,8 +9,11 @@ evaluation and delivery. Use the cumulative 1,000,000-step budget, reuse valid p
 and make the documented routine decisions without repeated confirmation. Do not train
 on the user's Mac. A request only to read, review or edit is not a training request.
 
-Preserve the course's one-step A2C, original observations/rewards, exact environment,
-teacher interface and dependency versions. Keep source comments in English: separate
+Preserve the course's one-step A2C as the CLI baseline, original observations/rewards, exact environment,
+teacher interface and dependency versions. For the Issue #1 comparison, use the README's
+optional 8-step returns and 0.5 gradient limit in a separate run; never reuse an old
+one-step checkpoint as though it were the new experiment. Reuse the validated Windows
+environment instead of reinstalling dependencies. Keep source comments in English: separate
 complete modules with two blank lines, introduce them with aligned standalone comments,
 and use inline comments for non-obvious details only.
 

@@ -41,3 +41,6 @@ jobs:
       - name: Run checks with zero optimizer steps
         shell: pwsh
         run: conda run --no-capture-output -n cs100709 python -B train.py --mode check --device cpu --num-envs 8
+      - name: Check multistep variant without training
+        shell: pwsh
+        run: conda run --no-capture-output -n cs100709 python -B train.py --mode check --device cpu --num-envs 8 --return-steps 8 --max-grad-norm 0.5
