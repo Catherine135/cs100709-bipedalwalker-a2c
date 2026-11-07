@@ -13,6 +13,12 @@ Primary source
     not proven improvements or literal copies of the handout's default update.
     Evaluation records finish/fall/time-limit, distance and original reward terms;
     diagnostic coordinates are never added to the policy observation or reward.
+    For the user's subsequent 300-point objective, --algorithm ppo uses the cited
+    Stable-Baselines3 2.4.1 implementation, GAE, clipped updates and internal
+    observation normalization. Original rewards and the 1600-step task stay fixed.
+    PPO requires: python -m pip install stable-baselines3==2.4.1
+    Reuse existing dependencies; do not reinstall PyTorch. The exported Agent
+    stores normalization statistics and CPU weights and needs no SB3 for inference.
 
 Windows setup (run in a Miniconda Prompt)
     conda create -n cs100709 -c conda-forge python=3.11 box2d-py=2.3.8 pip -y
@@ -34,6 +40,8 @@ Commands (keep this file named train.py)
     python train.py --mode train --resume runs/RUN/checkpoint.pt --steps 2000000
     python train.py --mode eval --model-path a2c.model --eval-seeds 1 3 5 7 9 --render
     python train.py --mode train --return-steps 8 --max-grad-norm 0.5 --log-dir runs/nstep --model-path runs/nstep/a2c.model
+    python train.py --mode check --algorithm ppo
+    python train.py --mode train --algorithm ppo --steps 20000000 --log-dir runs/ppo --model-path runs/ppo/a2c.model
     tensorboard --logdir runs
 
 Modes and outputs
@@ -65,6 +73,8 @@ Compatibility references (algorithm remains based on the handout)
     https://docs.pytorch.org/docs/2.8/generated/torch.load.html
     https://stable-baselines3.readthedocs.io/en/master/modules/a2c.html
     https://arxiv.org/abs/1602.01783
+    https://arxiv.org/abs/1707.06347
+    https://github.com/DLR-RM/stable-baselines3/tree/v2.4.1
 """
 
 
@@ -109,11 +119,11 @@ class Mish(nn.Module):
 
 # Map observations to independent Gaussian means and learned joint deviations.
 class Actor(nn.Module):
-    def __init__(self, state_dim, n_actions, hidden_dim):
+    def __init__(self, state_dim, n_actions, hidden_dim, activation=Mish):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim), Mish(),
-            nn.Linear(hidden_dim, hidden_dim), Mish(),
+            nn.Linear(state_dim, hidden_dim), activation(),
+            nn.Linear(hidden_dim, hidden_dim), activation(),
             nn.Linear(hidden_dim, n_actions),
         )
         self.logstds = nn.Parameter(torch.full((n_actions,), 0.1))
@@ -128,11 +138,11 @@ class Actor(nn.Module):
 
 # Estimate one state value using a network separate from the policy.
 class Critic(nn.Module):
-    def __init__(self, state_dim, hidden_dim):
+    def __init__(self, state_dim, hidden_dim, activation=Mish):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim), Mish(),
-            nn.Linear(hidden_dim, hidden_dim), Mish(),
+            nn.Linear(state_dim, hidden_dim), activation(),
+            nn.Linear(hidden_dim, hidden_dim), activation(),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -204,6 +214,8 @@ class Agent:
             "critic_lr": float(values.get("critic_lr", 4e-3)),
             "return_steps": int(values.get("return_steps", 1)),
             "max_grad_norm": float(values.get("max_grad_norm", 0.0)),
+            "activation": values.get("activation", "mish"),
+            "observation_normalization": values.get("observation_normalization", None),
             "action_low": np.broadcast_to(values.get("action_low", -1.0), (ACTION_DIM,)).tolist(),
             "action_high": np.broadcast_to(values.get("action_high", 1.0), (ACTION_DIM,)).tolist(),
         }
@@ -220,8 +232,11 @@ class Agent:
         self.action_high = np.asarray(self.config["action_high"], dtype=np.float32)
         if not (np.all(self.action_low == -1) and np.all(self.action_high == 1)):
             raise ValueError("BipedalWalker requires action bounds [-1, 1] on every joint.")
-        self.actor = Actor(STATE_DIM, ACTION_DIM, self.config["hidden_dim"])
-        self.critic = Critic(STATE_DIM, self.config["hidden_dim"])
+        if self.config["activation"] not in ("mish", "tanh"):
+            raise ValueError("Unsupported activation.")
+        activation = Mish if self.config["activation"] == "mish" else nn.Tanh
+        self.actor = Actor(STATE_DIM, ACTION_DIM, self.config["hidden_dim"], activation)
+        self.critic = Critic(STATE_DIM, self.config["hidden_dim"], activation)
         self.actor_optim = None
         self.critic_optim = None
         self.to(values.get("device", "cpu"))
@@ -259,6 +274,12 @@ class Agent:
             raise ValueError(f"Expected a nonempty (batch, {STATE_DIM}) observation array.")
         if not np.isfinite(array).all():
             raise ValueError("Observations contain NaN or infinity.")
+        normalization = self.config["observation_normalization"]
+        if normalization is not None:
+            mean = np.asarray(normalization["mean"], dtype=np.float64)
+            variance = np.asarray(normalization["var"], dtype=np.float64)
+            array = np.clip((array - mean) / np.sqrt(variance + normalization["epsilon"]),
+                            -normalization["clip_obs"], normalization["clip_obs"]).astype(np.float32)
         return torch.as_tensor(array, device=self.device)
 
 
@@ -1152,10 +1173,271 @@ def run_checks(args):
     print("All checks passed. Optimizer steps: 0. No trained model was produced.")
 
 
+# Import the optional, pinned PPO implementation only for PPO work.
+def ppo_dependencies():
+    import stable_baselines3 as sb3
+    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import (
+        DummyVecEnv,
+        SubprocVecEnv,
+        VecNormalize,
+    )
+    if sb3.__version__ != "2.4.1":
+        raise RuntimeError("PPO requires stable-baselines3==2.4.1; reuse the existing Python environment.")
+    return sb3.PPO, BaseCallback, Monitor, DummyVecEnv, SubprocVecEnv, VecNormalize
+
+
+# Preserve raw environment rewards; normalize observations only inside the learner.
+def make_ppo_env():
+    _, _, Monitor, _, _, _ = ppo_dependencies()
+    return Monitor(make_env())
+
+
+def normalization_state(env):
+    return {"mean": env.obs_rms.mean.tolist(), "var": env.obs_rms.var.tolist(),
+            "count": float(env.obs_rms.count), "clip_obs": float(env.clip_obs), "epsilon": float(env.epsilon)}
+
+
+# Export PPO weights into the portable Agent, so teacher evaluation needs no SB3.
+def export_ppo_agent(model, env):
+    with torch.random.fork_rng(devices=[]):
+        agent = Agent({"hidden_dim": 256, "activation": "tanh",
+                       "observation_normalization": normalization_state(env)})
+    policy = model.policy
+    for destination, features, head in ((agent.actor.model, policy.mlp_extractor.policy_net, policy.action_net),
+                                         (agent.critic.model, policy.mlp_extractor.value_net, policy.value_net)):
+        for index in (0, 2):
+            destination[index].load_state_dict(cpu_tree(features[index].state_dict()))
+        destination[4].load_state_dict(cpu_tree(head.state_dict()))
+    with torch.no_grad():
+        agent.actor.logstds.copy_(policy.log_std.detach().cpu())
+    return agent
+
+
+# Save only completed PPO updates, with optimizer state, observation statistics and RNG.
+def save_ppo_checkpoint(model, env, args, best_state, best_score, confirmed, path):
+    buffer = io.BytesIO()
+    model.save(buffer)
+    atomic_save({"kind": "ppo_training_checkpoint", "format_version": FORMAT_VERSION,
+                 "model_zip": torch.from_numpy(np.frombuffer(buffer.getvalue(), dtype=np.uint8).copy()),
+                 "normalization": normalization_state(env), "steps": int(model.num_timesteps),
+                 "best_agent": best_state, "best_score": best_score, "confirmed": confirmed,
+                 "config": vars(args).copy(), "rng": cpu_tree(capture_rng())}, path)
+
+
+# Train the cited PPO implementation without changing the teacher's task or reward.
+def run_ppo_training(args):
+    PPO, BaseCallback, _, DummyVecEnv, SubprocVecEnv, VecNormalize = ppo_dependencies()
+    class Finished(Exception):
+        pass
+
+    resume = torch.load(args.resume, map_location="cpu", weights_only=True) if args.resume else None
+    if resume and (resume.get("kind") != "ppo_training_checkpoint" or resume.get("format_version") != FORMAT_VERSION):
+        raise ValueError("PPO cannot resume an A2C checkpoint. Start an independent experiment.")
+    if resume:
+        if args.steps < resume["steps"]:
+            raise ValueError("The requested cumulative budget precedes the checkpoint.")
+        if args.num_envs != resume["config"]["num_envs"]:
+            raise ValueError("PPO resume requires the checkpoint's num-envs.")
+        args.seed = resume["config"]["seed"]
+        args.validation_seeds = resume["config"]["validation_seeds"]
+        args.confirmation_seeds = resume["config"]["confirmation_seeds"]
+        if set(args.eval_seeds) & (set(args.validation_seeds) | set(args.confirmation_seeds)):
+            raise ValueError("Final evaluation seeds overlap the checkpoint's validation/confirmation sets.")
+    log_root = Path(args.log_dir)
+    log_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-ppo-"), dir=log_root)).resolve()
+    factories = [make_ppo_env] * args.num_envs
+    vector = DummyVecEnv(factories) if args.num_envs == 1 else SubprocVecEnv(factories, start_method="spawn")
+    env = VecNormalize(vector, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    try:
+        if resume:
+            stats = resume["normalization"]
+            env.obs_rms.mean = np.asarray(stats["mean"], dtype=np.float64)
+            env.obs_rms.var = np.asarray(stats["var"], dtype=np.float64)
+            env.obs_rms.count = stats["count"]
+            env.clip_obs, env.epsilon = stats["clip_obs"], stats["epsilon"]
+            model = PPO.load(io.BytesIO(resume["model_zip"].numpy().tobytes()), env=env, device=args.device)
+            model.tensorboard_log = str(run_dir)
+            restore_rng(resume["rng"])
+        else:
+            model = PPO("MlpPolicy", env, device=args.device, seed=args.seed,
+                        n_steps=args.ppo_rollout_steps, batch_size=args.ppo_batch_size,
+                        learning_rate=2.5e-4, n_epochs=10, gamma=0.99, gae_lambda=0.95,
+                        clip_range=0.2, ent_coef=0.001, vf_coef=0.5, max_grad_norm=0.5,
+                        target_kl=0.02, normalize_advantage=True,
+                        policy_kwargs={"activation_fn": nn.Tanh, "net_arch": {"pi": [256, 256], "vf": [256, 256]}},
+                        tensorboard_log=str(run_dir), verbose=1)
+        best_state = resume["best_agent"] if resume else None
+        best_score = resume["best_score"] if resume else -math.inf
+        confirmed = False  # Recheck the goal after resume rather than trusting a stale flag.
+        last_eval = -1
+        next_eval = model.num_timesteps if resume else 0
+        effective = {"arguments": vars(args), "algorithm": "Stable-Baselines3 PPO 2.4.1",
+                     "reward_normalization": False, "observation_normalization": True,
+                     "ppo": {"n_steps": model.n_steps, "batch_size": model.batch_size,
+                             "gamma": model.gamma, "gae_lambda": model.gae_lambda, "epochs": model.n_epochs}}
+        (run_dir / "config.json").write_text(json.dumps(effective, indent=2), encoding="utf-8")
+        print(f"Training directory: {run_dir}\nPPO budget: {args.steps}; complete rollouts may exceed it by at most {model.n_steps * args.num_envs - 1} steps.", flush=True)
+
+        # Validate original rewards and require a second seed set before claiming 300.
+        def boundary(force=False):
+            nonlocal best_state, best_score, confirmed, last_eval, next_eval
+            if model.num_timesteps >= next_eval or (force and last_eval != model.num_timesteps):
+                candidate = export_ppo_agent(model, env)
+                result = evaluate_agent(candidate, args.validation_seeds)
+                result.update(steps=int(model.num_timesteps), phase="validation")
+                confirmation = None
+                if result["mean_reward"] >= args.target_reward and result["success_rate"] == 1.0:
+                    confirmation = evaluate_agent(candidate, args.confirmation_seeds)
+                    confirmation.update(steps=int(model.num_timesteps), phase="confirmation")
+                    confirmed = confirmation["mean_reward"] >= args.target_reward and confirmation["success_rate"] == 1.0
+                if result["mean_reward"] > best_score or confirmed:
+                    best_state, best_score = candidate.__getstate__(), result["mean_reward"]
+                with (run_dir / "evaluations.jsonl").open("a", encoding="utf-8") as output:
+                    for row in (result, confirmation):
+                        if row is not None:
+                            output.write(json.dumps(row, allow_nan=False) + "\n")
+                print(f"PPO validation at {model.num_timesteps}: mean={result['mean_reward']:.3f}, success={result['success_rate']:.2f}, confirmed={confirmed}", flush=True)
+                if hasattr(model, "_logger"):
+                    model.logger.record("evaluation/mean_reward", result["mean_reward"])
+                    model.logger.record("evaluation/success_rate", result["success_rate"])
+                    model.logger.dump(step=model.num_timesteps)
+                last_eval = model.num_timesteps
+                next_eval = model.num_timesteps + args.ppo_eval_steps
+            if best_state is not None:
+                for path in {run_dir / "a2c.model", Path(args.model_path).resolve()}:
+                    atomic_save(agent_from_state(best_state), path)
+            save_ppo_checkpoint(model, env, args, best_state, best_score, confirmed, run_dir / "checkpoint.pt")
+
+        # SB3 calls rollout_start after the preceding rollout's optimizer updates finish.
+        class SaveAtBoundary(BaseCallback):
+            def _on_rollout_start(self):
+                boundary()
+                if stop.requested or confirmed:
+                    raise Finished
+
+            def _on_step(self):
+                for info in self.locals.get("infos", []):
+                    if "episode" in info:
+                        row = {"steps": int(model.num_timesteps), **info["episode"]}
+                        with (run_dir / "episodes.jsonl").open("a", encoding="utf-8") as output:
+                            output.write(json.dumps(row) + "\n")
+                return True
+
+        with StopRequest() as stop:
+            try:
+                if args.steps > model.num_timesteps:
+                    model.learn(total_timesteps=args.steps - model.num_timesteps,
+                                reset_num_timesteps=False, callback=SaveAtBoundary(), tb_log_name="ppo")
+            except Finished:
+                pass
+            boundary(force=True)
+        result = evaluate_agent(agent_from_state(best_state), args.eval_seeds)
+        result.update(steps=int(model.num_timesteps), validation_and_confirmation_passed=confirmed,
+                      target_reward=args.target_reward,
+                      example_set_passed=result["mean_reward"] >= args.target_reward and result["success_rate"] == 1.0)
+        (run_dir / "final-evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(json.dumps(result, indent=2), flush=True)
+        print(f"Saved {run_dir / 'checkpoint.pt'}. Goal confirmed: {confirmed}; example-set pass: {result['example_set_passed']}", flush=True)
+    finally:
+        env.close()
+        if "model" in locals() and hasattr(model, "_logger"):
+            for output in model.logger.output_formats:
+                output.close()
+
+
+# Verify PPO export and resume without ever calling learn or an optimizer step.
+def check_ppo(args):
+    import contextlib
+    from unittest.mock import patch
+    PPO, _, _, DummyVecEnv, SubprocVecEnv, VecNormalize = ppo_dependencies()
+    factories = [make_ppo_env] * args.num_envs
+    vector = DummyVecEnv(factories) if args.num_envs == 1 else SubprocVecEnv(factories, start_method="spawn")
+    env = VecNormalize(vector, norm_obs=True, norm_reward=False)
+    try:
+        with patch.object(torch.optim.Adam, "step", side_effect=AssertionError("No optimizer steps in checks")):
+            model = PPO("MlpPolicy", env, seed=args.seed, n_steps=8, batch_size=8, device=args.device,
+                        policy_kwargs={"activation_fn": nn.Tanh, "net_arch": {"pi": [256, 256], "vf": [256, 256]}})
+            observations = env.reset()
+            for _ in range(4):
+                action, _ = model.predict(observations, deterministic=True)
+                observations, _, _, _ = env.step(action)
+            exported = export_ppo_agent(model, env)
+            state = env.get_original_obs()[0]
+            expected, _ = model.predict(env.normalize_obs(state[None, :]), deterministic=True)
+            np.testing.assert_allclose(exported.select_action(state, eval=True), expected[0], atol=1e-6)
+            with tempfile.TemporaryDirectory() as folder:
+                check_fresh_process(exported, folder)
+                destination = Path(folder) / "checkpoint.pt"
+                for group in model.policy.optimizer.param_groups:
+                    for parameter in group["params"]:
+                        model.policy.optimizer.state[parameter] = {"step": torch.tensor(7.0),
+                                                                   "exp_avg": torch.zeros_like(parameter),
+                                                                   "exp_avg_sq": torch.ones_like(parameter)}
+                save_ppo_checkpoint(model, env, args, exported.__getstate__(), -100.0, False, destination)
+                state = torch.load(destination, weights_only=True)
+                restored = PPO.load(io.BytesIO(state["model_zip"].numpy().tobytes()), env=env, device=args.device)
+                assert all(item["step"].item() == 7.0 for item in restored.policy.optimizer.state.values())
+                actual, _ = restored.predict(observations, deterministic=True)
+                expected, _ = model.predict(observations, deterministic=True)
+                np.testing.assert_array_equal(actual, expected)
+                # Exercise orchestration and boundary saves with a mocked learner, not training.
+                test_args = parse_args(["--algorithm", "ppo", "--num-envs", "1", "--steps", "8",
+                                        "--ppo-rollout-steps", "8", "--ppo-batch-size", "8",
+                                        "--log-dir", str(Path(folder) / "runs"),
+                                        "--model-path", str(Path(folder) / "candidate.model")])
+                def fake_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name):
+                    callback.model = current
+                    callback._on_rollout_start()
+                    current.num_timesteps += total_timesteps
+                    return current
+                def fake_eval(current, seeds):
+                    return {"seeds": list(seeds), "rewards": [0.] * len(seeds), "lengths": [1] * len(seeds),
+                            "mean_reward": 0., "std_reward": 0., "success_rate": 0., "diagnostics": []}
+                with patch.object(PPO, "learn", fake_learn), patch("train.evaluate_agent", fake_eval), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    run_ppo_training(test_args)
+                    checkpoint_path = next((Path(folder) / "runs").rglob("checkpoint.pt"))
+                    checkpoint = torch.load(checkpoint_path, weights_only=True)
+                    assert checkpoint["steps"] == 8 and not checkpoint["confirmed"]
+                    test_args.resume = str(checkpoint_path)
+                    test_args.steps = 16
+                    run_ppo_training(test_args)
+                saved = [torch.load(p, weights_only=True)["steps"] for p in (Path(folder) / "runs").rglob("checkpoint.pt")]
+                assert sorted(saved) == [8, 16]
+                for confirmation_passes in (False, True):
+                    test_args.resume = None
+                    test_args.steps = 8
+                    test_args.ppo_eval_steps = 1
+                    test_args.log_dir = str(Path(folder) / f"goal-{confirmation_passes}")
+                    def goal_eval(current, seeds, passes=confirmation_passes):
+                        score = 299.0 if seeds == test_args.confirmation_seeds and not passes else 310.0
+                        return {"seeds": list(seeds), "rewards": [score] * len(seeds), "lengths": [1] * len(seeds),
+                                "mean_reward": score, "std_reward": 0., "success_rate": 1., "diagnostics": []}
+                    with patch.object(PPO, "learn", fake_learn), patch("train.evaluate_agent", goal_eval), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        run_ppo_training(test_args)
+                    result_path = next(Path(test_args.log_dir).rglob("final-evaluation.json"))
+                    result = json.loads(result_path.read_text())
+                    assert result["validation_and_confirmation_passed"] == confirmation_passes
+                    assert result["example_set_passed"]
+    finally:
+        env.close()
+    print("PASS: PPO normalized-observation export, teacher load, mocked lifecycle/goal checks and checkpoint round trip. Optimizer steps: 0.")
+
+
 # Parse explicit modes and keep training budgets consistent with vector stepping.
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="CS100709 document-based A2C; see this file's header for setup.")
     parser.add_argument("--mode", choices=("train", "eval", "check", "benchmark"), default="train")
+    parser.add_argument("--algorithm", choices=("a2c", "ppo"), default="a2c")
+    parser.add_argument("--ppo-rollout-steps", type=int, default=2048)
+    parser.add_argument("--ppo-batch-size", type=int, default=64)
+    parser.add_argument("--ppo-eval-steps", type=int, default=100000)
+    parser.add_argument("--target-reward", type=float, default=300.0)
+    parser.add_argument("--confirmation-seeds", type=int, nargs="+", default=list(range(201, 241, 2)))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--torch-threads", type=int, default=1)
@@ -1194,6 +1476,20 @@ def parse_args(argv=None):
         parser.error("--resume is only valid in training mode.")
     if args.render and args.mode != "eval":
         parser.error("--render is only valid in evaluation mode.")
+    if args.algorithm == "ppo":
+        if min(args.ppo_rollout_steps, args.ppo_eval_steps) < 1 or args.ppo_batch_size < 2:
+            parser.error("PPO needs positive rollout/evaluation sizes and batch size >= 2.")
+        if args.ppo_rollout_steps * args.num_envs % args.ppo_batch_size:
+            parser.error("PPO rollout size must be a multiple of ppo-batch-size.")
+        if not math.isfinite(args.target_reward) or any(s < 0 or s >= 2**32 for s in args.confirmation_seeds):
+            parser.error("Invalid PPO target or confirmation seeds.")
+        groups = [set(args.validation_seeds), set(args.confirmation_seeds), set(args.eval_seeds)]
+        if any(len(values) != len(set(values)) for values in (args.validation_seeds, args.confirmation_seeds, args.eval_seeds)):
+            parser.error("PPO evaluation seed lists must not contain duplicates.")
+        if any(groups[i] & groups[j] for i in range(3) for j in range(i)):
+            parser.error("PPO validation, confirmation and final evaluation seeds must be disjoint.")
+        if args.mode == "benchmark":
+            parser.error("The A2C benchmark does not measure PPO throughput; use observed PPO training timing.")
     return args
 
 
@@ -1204,6 +1500,8 @@ def main(argv=None):
     preflight(args)
     if args.mode == "check":
         run_checks(args)
+        if args.algorithm == "ppo":
+            check_ppo(args)
     elif args.mode == "benchmark":
         run_benchmark(args)
     elif args.mode == "eval":
@@ -1213,7 +1511,10 @@ def main(argv=None):
         agent.to(args.device)
         print(json.dumps(evaluate_agent(agent, args.eval_seeds, args.render), indent=2))
     else:
-        run_training(args)
+        if args.algorithm == "ppo":
+            run_ppo_training(args)
+        else:
+            run_training(args)
     return 0
 
 

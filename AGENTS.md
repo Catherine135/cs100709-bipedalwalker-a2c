@@ -1,23 +1,22 @@
-# Training handoff
+# Agent handoff
 
-Read `README.md` before acting. It contains the complete task, exact environment,
-PowerShell commands, device-selection rules, resume procedure and acceptance criteria.
-The original chat and course PDF are not required to execute the documented run.
+Read README.md first. The current user request is to improve the uploaded baseline
+as much as possible toward an original-reward score of 300. The main Windows path
+is now PPO; A2C remains a reproducible baseline. The README supersedes the earlier
+one-million-step A2C-only handoff and explains the bounded 20-million-step PPO run.
 
-When the user asks to train this repository, complete the Windows workflow through
-evaluation and delivery. Use the cumulative 1,000,000-step budget, reuse valid progress,
-and make the documented routine decisions without repeated confirmation. Do not train
-on the user's Mac. A request only to read, review or edit is not a training request.
+Reuse GWTower's validated Python environment. Add only missing PPO dependencies;
+do not reinstall PyTorch. Preserve the exact 1600-step Hardcore environment and
+raw rewards. Observation normalization is internal and exported with the Agent.
+Never train on the user's Mac; read-only model evaluation and zero-update checks
+are allowed. Reading or editing this repository alone is not a request to train.
 
-Preserve the course's one-step A2C as the CLI baseline, original observations/rewards, exact environment,
-teacher interface and dependency versions. For the Issue #1 comparison, use the README's
-optional 8-step returns and 0.5 gradient limit in a separate run; never reuse an old
-one-step checkpoint as though it were the new experiment. Reuse the validated Windows
-environment instead of reinstalling dependencies. Keep source comments in English: separate
-complete modules with two blank lines, introduce them with aligned standalone comments,
-and use inline comments for non-obvious details only.
+Follow the README through evaluation and delivery when asked to train. Verify
+process identity before resuming; never load an A2C checkpoint as PPO. Preserve
+old runs, and do not publish new models or logs unless asked. Report measured
+scores honestly; 300 is a target, not a guarantee or a quoted course passing rule.
 
-Do not claim completion just because a process started or self-checks passed. Record
-actual steps, rewards, checks, model hashes, process state and artifact paths. Preserve
-old runs and checkpoints. Do not publish trained artifacts to this public repository
-unless the user asks. For code/documentation changes, run relevant non-training checks.
+Keep the single train.py deliverable and teacher Agent interface. Comments are
+English, complete modules have two blank lines between them, and standalone
+aligned comments introduce each module. Cite third-party algorithms. Run relevant
+non-training checks after changes; do not use model fitting as a local test.
