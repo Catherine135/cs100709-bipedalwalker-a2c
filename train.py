@@ -1,4 +1,4 @@
-"""CS100709: document-based A2C for BipedalWalker HARDCORE.
+"""CS100709: A2C baseline and autonomous PPO campaign for BipedalWalker HARDCORE.
 
 Primary source
     CS100709_Reinforcement_Learning_Project.pdf, credited to Hongtu Zhou,
@@ -19,6 +19,10 @@ Primary source
     PPO requires: python -m pip install stable-baselines3==2.4.1
     Reuse existing dependencies; do not reinstall PyTorch. The exported Agent
     stores normalization statistics and CPU weights and needs no SB3 for inference.
+    Issue #2 adds two best-policy warm-start pilots (gamma 0.99 / 0.999),
+    scheduled PPO updates, independent-seed replication, bounded continuation,
+    complete best checkpoints and a frozen final holdout. See README.md for the
+    protocol and the reviewed public projects; their scores are not our results.
 
 Windows setup (run in a Miniconda Prompt)
     conda create -n cs100709 -c conda-forge python=3.11 box2d-py=2.3.8 pip -y
@@ -41,11 +45,18 @@ Commands (keep this file named train.py)
     python train.py --mode eval --model-path a2c.model --eval-seeds 1 3 5 7 9 --render
     python train.py --mode train --return-steps 8 --max-grad-norm 0.5 --log-dir runs/nstep --model-path runs/nstep/a2c.model
     python train.py --mode check --algorithm ppo
+    python train.py --mode campaign --dry-run
+    python train.py --mode campaign --campaign-dir runs/campaign-issue2-v3
     python train.py --mode train --algorithm ppo --steps 20000000 --log-dir runs/ppo --model-path runs/ppo/a2c.model
     tensorboard --logdir runs
 
 Modes and outputs
-    Only train calls optimizer.step(). Check and benchmark never update weights.
+    Train and campaign update weights on Windows. Check, eval, dry-run and
+    benchmark never update weights. The CLI rejects training on the user's Mac.
+    Campaign defaults: CPU, 16 environments, 1 thread, minibatches of 256;
+    two 5M-step pilots, replication, and bounded continuation within a total 100M
+    interaction budget. Stage budgets round down to complete rollouts. Reissue
+    the identical campaign command to resume; no PyTorch reinstall is required.
     Benchmark times environment sampling plus forward/backward computation; it
     excludes optimizer steps, logging, evaluation and saving, so it is a throughput
     comparison rather than an estimate of total training time.
@@ -80,6 +91,7 @@ Compatibility references (algorithm remains based on the handout)
 
 # Import dependencies without creating environments, files or worker processes.
 import argparse
+import hashlib
 import io
 import json
 import math
@@ -88,10 +100,14 @@ import os
 import platform
 import random
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -108,6 +124,10 @@ EPISODE_LIMIT = 1600
 FORMAT_VERSION = 1
 VALIDATION_SEEDS = [101, 103, 105, 107, 109]
 EXAMPLE_SEEDS = [1, 3, 5, 7, 9]
+CAMPAIGN_VALIDATION_SEEDS = list(range(101, 141, 2))
+CAMPAIGN_SELECTION_SEEDS = list(range(401, 441, 2))
+BASELINE_URL = "https://github.com/Catherine135/cs100709-bipedalwalker-a2c/releases/download/ppo-20261107-results/a2c.model"
+BASELINE_SHA256 = "3fd5afb261316ef0b79212d96ea982b940bc4ef07987e573a914a2002ac36769"
 __all__ = ["Actor", "Agent", "Critic", "Mish"]
 
 
@@ -494,6 +514,9 @@ class WalkerDiagnostics:
         self.terms = {"forward": 0.0, "posture": 0.0, "motor": 0.0, "terminal_adjustment": 0.0}
         self.raw_return = 0.0
         self.action_total = self.clipped = self.steps = 0
+        self.window_x = self.previous_x
+        self.window_max_x = self.previous_x
+        self.stalled_windows = self.complete_windows = 0
 
 
     def observe(self, raw_action, action, reward):
@@ -511,6 +534,11 @@ class WalkerDiagnostics:
         self.steps += 1
         self.previous_x, self.previous_angle = x, angle
         self.max_x = max(self.max_x, x)
+        self.window_max_x = max(self.window_max_x, x)
+        if self.steps % 100 == 0:
+            self.stalled_windows += int(self.window_max_x - self.window_x < 0.1)
+            self.complete_windows += 1
+            self.window_x = self.window_max_x = x
 
 
     def result(self, terminated, truncated):
@@ -524,6 +552,8 @@ class WalkerDiagnostics:
                 "progress_fraction": (self.max_x - self.start_x) / (self.finish_x - self.start_x),
                 "action_clip_fraction": self.clipped / (ACTION_DIM * max(1, self.steps)),
                 "mean_abs_action": self.action_total / (ACTION_DIM * max(1, self.steps)),
+                "stall_fraction": self.stalled_windows / max(1, self.complete_windows),
+                "stall_window_steps": 100, "stall_distance_threshold": 0.1,
                 "reward_terms": self.terms.copy(),
                 "reward_reconstruction_error": self.raw_return - sum(self.terms.values())}
 
@@ -1202,7 +1232,7 @@ def normalization_state(env):
 # Export PPO weights into the portable Agent, so teacher evaluation needs no SB3.
 def export_ppo_agent(model, env):
     with torch.random.fork_rng(devices=[]):
-        agent = Agent({"hidden_dim": 256, "activation": "tanh",
+        agent = Agent({"hidden_dim": 256, "activation": "tanh", "gamma": float(model.gamma),
                        "observation_normalization": normalization_state(env)})
     policy = model.policy
     for destination, features, head in ((agent.actor.model, policy.mlp_extractor.policy_net, policy.action_net),
@@ -1215,115 +1245,263 @@ def export_ppo_agent(model, env):
     return agent
 
 
-# Save only completed PPO updates, with optimizer state, observation statistics and RNG.
-def save_ppo_checkpoint(model, env, args, best_state, best_score, confirmed, path):
+# Save JSON through an atomic replacement, including campaign decisions and progress.
+def atomic_json(value, destination):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=destination.name, suffix=".tmp", dir=destination.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as output:
+            json.dump(value, output, indent=2, allow_nan=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+# Hold an operating-system lock; a crashed process releases it automatically.
+@contextmanager
+def file_lock(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise RuntimeError(f"Another process is using {path}; do not start a second run.") from error
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+# Keep schedules above a nonzero floor, including the final completed rollout.
+def linear_schedule(start, end):
+    return lambda remaining: float(end + (start - end) * min(1.0, max(0.0, remaining)))
+
+
+def restore_normalization(env, stats):
+    env.obs_rms.mean = np.asarray(stats["mean"], dtype=np.float64)
+    env.obs_rms.var = np.asarray(stats["var"], dtype=np.float64)
+    env.obs_rms.count = float(stats["count"])
+    env.clip_obs, env.epsilon = float(stats["clip_obs"]), float(stats["epsilon"])
+
+
+# Import a portable policy without importing the last run's degraded parameters.
+def warm_start_ppo(model, env, agent, reset_critic=False):
+    if not isinstance(agent, Agent) or agent.config["activation"] != "tanh" or agent.config["hidden_dim"] != 256:
+        raise ValueError("PPO warm start requires an exported two-layer 256-unit Tanh Agent.")
+    stats = agent.config["observation_normalization"]
+    if stats is None:
+        raise ValueError("The PPO warm-start model must contain observation statistics.")
+    restore_normalization(env, stats)
+    pairs = [(agent.actor.model, model.policy.mlp_extractor.policy_net, model.policy.action_net)]
+    if not reset_critic:
+        if not math.isclose(agent.config["gamma"], model.gamma):
+            raise ValueError("A changed gamma requires --reset-critic and a critic warm-up.")
+        pairs.append((agent.critic.model, model.policy.mlp_extractor.value_net, model.policy.value_net))
+    for source, features, head in pairs:
+        for index in (0, 2):
+            features[index].load_state_dict(source[index].state_dict())
+        head.load_state_dict(source[4].state_dict())
+    with torch.no_grad():
+        model.policy.log_std.copy_(agent.actor.logstds.to(model.device))
+
+
+# Freeze only the policy during value recalibration; separate value parameters remain trainable.
+def set_ppo_actor_trainable(model, enabled):
+    for module in (model.policy.mlp_extractor.policy_net, model.policy.action_net):
+        module.requires_grad_(enabled)
+    model.policy.log_std.requires_grad_(enabled)
+
+
+def optimizer_step_count(model):
+    counts = [int(state["step"].item()) for state in model.policy.optimizer.state.values() if "step" in state]
+    return max(counts, default=0)
+
+
+def target_passed(result, target=300.0):
+    return result["mean_reward"] >= target and result["success_rate"] == 1.0
+
+
+# Save complete updates, with the optimizer matching the exported best policy.
+def save_ppo_checkpoint(model, env, args, best_state, best_score, confirmed, path, runtime=None):
     buffer = io.BytesIO()
     model.save(buffer)
     atomic_save({"kind": "ppo_training_checkpoint", "format_version": FORMAT_VERSION,
                  "model_zip": torch.from_numpy(np.frombuffer(buffer.getvalue(), dtype=np.uint8).copy()),
                  "normalization": normalization_state(env), "steps": int(model.num_timesteps),
                  "best_agent": best_state, "best_score": best_score, "confirmed": confirmed,
-                 "config": vars(args).copy(), "rng": cpu_tree(capture_rng())}, path)
+                 "config": vars(args).copy(), "rng": cpu_tree(capture_rng()),
+                 "runtime": runtime or {}, "optimizer_steps": optimizer_step_count(model)}, path)
 
 
-# Train the cited PPO implementation without changing the teacher's task or reward.
+def read_ppo_checkpoint(path):
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if state.get("kind") != "ppo_training_checkpoint" or state.get("format_version") != FORMAT_VERSION:
+        raise ValueError("Expected a PPO checkpoint, not an A2C checkpoint or exported Agent.")
+    return state
+
+
+# Train in an isolated run directory, or resume that directory under its process lock.
 def run_ppo_training(args):
+    if args.run_dir:
+        with file_lock(Path(args.run_dir) / "run.lock"):
+            return _run_ppo_training(args)
+    return _run_ppo_training(args)
+
+
+def _run_ppo_training(args):
     PPO, BaseCallback, _, DummyVecEnv, SubprocVecEnv, VecNormalize = ppo_dependencies()
     class Finished(Exception):
         pass
 
-    resume = torch.load(args.resume, map_location="cpu", weights_only=True) if args.resume else None
-    if resume and (resume.get("kind") != "ppo_training_checkpoint" or resume.get("format_version") != FORMAT_VERSION):
-        raise ValueError("PPO cannot resume an A2C checkpoint. Start an independent experiment.")
+    resume = read_ppo_checkpoint(args.resume) if args.resume else None
+    initial = read_ppo_checkpoint(args.init_checkpoint) if args.init_checkpoint else None
     if resume:
-        if args.steps < resume["steps"]:
-            raise ValueError("The requested cumulative budget precedes the checkpoint.")
-        if args.num_envs != resume["config"]["num_envs"]:
-            raise ValueError("PPO resume requires the checkpoint's num-envs.")
-        args.seed = resume["config"]["seed"]
-        args.validation_seeds = resume["config"]["validation_seeds"]
-        args.confirmation_seeds = resume["config"]["confirmation_seeds"]
+        if args.steps < resume["steps"] or args.num_envs != resume["config"]["num_envs"]:
+            raise ValueError("Resume needs a sufficient cumulative budget and the original number of environments.")
+        for key in ("seed", "validation_seeds", "confirmation_seeds", "defer_confirmation"):
+            if key in resume["config"]:
+                setattr(args, key, resume["config"][key])
         if set(args.eval_seeds) & (set(args.validation_seeds) | set(args.confirmation_seeds)):
-            raise ValueError("Final evaluation seeds overlap the checkpoint's validation/confirmation sets.")
-    log_root = Path(args.log_dir)
-    log_root.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-ppo-"), dir=log_root)).resolve()
+            raise ValueError("Evaluation seeds overlap the checkpoint's validation or confirmation seeds.")
+    if args.run_dir:
+        run_dir = Path(args.run_dir).resolve()
+        if (run_dir / "config.json").exists() and not resume:
+            raise ValueError("Run directory exists. Resume its checkpoint or use a new directory.")
+    else:
+        Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-ppo-"), dir=args.log_dir)).resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
     factories = [make_ppo_env] * args.num_envs
     vector = DummyVecEnv(factories) if args.num_envs == 1 else SubprocVecEnv(factories, start_method="spawn")
     env = VecNormalize(vector, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    started = time.monotonic()
     try:
-        if resume:
-            stats = resume["normalization"]
-            env.obs_rms.mean = np.asarray(stats["mean"], dtype=np.float64)
-            env.obs_rms.var = np.asarray(stats["var"], dtype=np.float64)
-            env.obs_rms.count = stats["count"]
-            env.clip_obs, env.epsilon = stats["clip_obs"], stats["epsilon"]
-            model = PPO.load(io.BytesIO(resume["model_zip"].numpy().tobytes()), env=env, device=args.device)
+        if resume or initial:
+            source = resume or initial
+            restore_normalization(env, source["normalization"])
+            model = PPO.load(io.BytesIO(source["model_zip"].numpy().tobytes()), env=env, device=args.device)
             model.tensorboard_log = str(run_dir)
-            restore_rng(resume["rng"])
+            if resume:
+                restore_rng(resume["rng"])
+            else:
+                if not math.isclose(model.gamma, args.gamma) or model.n_steps != args.ppo_rollout_steps:
+                    raise ValueError("Full-checkpoint continuation must preserve gamma and rollout length.")
+                model.num_timesteps = 0  # A new stage counts new interactions; optimizer moments are retained.
+                model._episode_num = 0
+                model._last_obs = None
+                model.set_random_seed(args.seed)
+                model.batch_size = args.ppo_batch_size
+                model.learning_rate = linear_schedule(args.ppo_learning_rate, args.ppo_final_lr)
+                model._setup_lr_schedule()
+                model.clip_range = linear_schedule(args.ppo_clip_range, args.ppo_final_clip)
+                model.target_kl = args.ppo_target_kl
+                model.n_epochs = args.ppo_epochs
         else:
             model = PPO("MlpPolicy", env, device=args.device, seed=args.seed,
                         n_steps=args.ppo_rollout_steps, batch_size=args.ppo_batch_size,
-                        learning_rate=2.5e-4, n_epochs=10, gamma=0.99, gae_lambda=0.95,
-                        clip_range=0.2, ent_coef=0.001, vf_coef=0.5, max_grad_norm=0.5,
-                        target_kl=0.02, normalize_advantage=True,
+                        learning_rate=linear_schedule(args.ppo_learning_rate, args.ppo_final_lr),
+                        n_epochs=args.ppo_epochs, gamma=args.gamma, gae_lambda=0.95,
+                        clip_range=linear_schedule(args.ppo_clip_range, args.ppo_final_clip),
+                        ent_coef=0.001, vf_coef=0.5, max_grad_norm=0.5,
+                        target_kl=args.ppo_target_kl, normalize_advantage=True,
                         policy_kwargs={"activation_fn": nn.Tanh, "net_arch": {"pi": [256, 256], "vf": [256, 256]}},
                         tensorboard_log=str(run_dir), verbose=1)
+            if args.warm_start:
+                warm_start_ppo(model, env, torch.load(args.warm_start, map_location="cpu", weights_only=True), args.reset_critic)
+        warmup_until = args.critic_warmup_rollouts * model.n_steps * args.num_envs
+        if resume:
+            warmup_until = resume.get("runtime", {}).get("warmup_until", 0)
+        elif initial:
+            warmup_until = max(0, initial.get("runtime", {}).get("warmup_until", 0) - initial["steps"])
         best_state = resume["best_agent"] if resume else None
         best_score = resume["best_score"] if resume else -math.inf
-        confirmed = False  # Recheck the goal after resume rather than trusting a stale flag.
-        last_eval = -1
-        next_eval = model.num_timesteps if resume else 0
+        best_result = resume.get("runtime", {}).get("best_validation") if resume else None
+        confirmed = False
+        validation_goal = False
+        last_eval, next_eval = -1, int(model.num_timesteps)
+        initial_steps = int(model.num_timesteps)
         effective = {"arguments": vars(args), "algorithm": "Stable-Baselines3 PPO 2.4.1",
                      "reward_normalization": False, "observation_normalization": True,
                      "ppo": {"n_steps": model.n_steps, "batch_size": model.batch_size,
-                             "gamma": model.gamma, "gae_lambda": model.gae_lambda, "epochs": model.n_epochs}}
-        (run_dir / "config.json").write_text(json.dumps(effective, indent=2), encoding="utf-8")
-        print(f"Training directory: {run_dir}\nPPO budget: {args.steps}; complete rollouts may exceed it by at most {model.n_steps * args.num_envs - 1} steps.", flush=True)
+                             "gamma": model.gamma, "gae_lambda": model.gae_lambda, "epochs": model.n_epochs,
+                             "learning_rate_start": model.lr_schedule(1.0), "learning_rate_end": model.lr_schedule(0.0),
+                             "clip_start": model.clip_range(1.0), "clip_end": model.clip_range(0.0),
+                             "target_kl": model.target_kl, "warmup_until": warmup_until}}
+        atomic_json(effective, run_dir / "config.json")
+        print(f"Training directory: {run_dir}\nPPO cumulative stage budget: {args.steps}; rollout size: {model.n_steps * args.num_envs}.", flush=True)
 
-        # Validate original rewards and require a second seed set before claiming 300.
+        # Validate only on development seeds during a campaign; holdout seeds stay unread.
         def boundary(force=False):
-            nonlocal best_state, best_score, confirmed, last_eval, next_eval
+            nonlocal best_state, best_score, best_result, confirmed, last_eval, next_eval, validation_goal
+            improved = False
             if model.num_timesteps >= next_eval or (force and last_eval != model.num_timesteps):
                 candidate = export_ppo_agent(model, env)
                 result = evaluate_agent(candidate, args.validation_seeds)
                 result.update(steps=int(model.num_timesteps), phase="validation")
+                validation_goal = target_passed(result, args.target_reward)
                 confirmation = None
-                if result["mean_reward"] >= args.target_reward and result["success_rate"] == 1.0:
+                if validation_goal and not args.defer_confirmation:
                     confirmation = evaluate_agent(candidate, args.confirmation_seeds)
                     confirmation.update(steps=int(model.num_timesteps), phase="confirmation")
-                    confirmed = confirmation["mean_reward"] >= args.target_reward and confirmation["success_rate"] == 1.0
-                if result["mean_reward"] > best_score or confirmed:
-                    best_state, best_score = candidate.__getstate__(), result["mean_reward"]
+                    confirmed = target_passed(confirmation, args.target_reward)
+                previous_goal = best_result is not None and target_passed(best_result, args.target_reward)
+                if best_state is None or (validation_goal, result["mean_reward"]) > (previous_goal, best_score) or confirmed:
+                    best_state, best_score, best_result = candidate.__getstate__(), result["mean_reward"], result
+                    improved = True
                 with (run_dir / "evaluations.jsonl").open("a", encoding="utf-8") as output:
                     for row in (result, confirmation):
                         if row is not None:
                             output.write(json.dumps(row, allow_nan=False) + "\n")
-                print(f"PPO validation at {model.num_timesteps}: mean={result['mean_reward']:.3f}, success={result['success_rate']:.2f}, confirmed={confirmed}", flush=True)
+                print(f"PPO validation at {model.num_timesteps}: mean={result['mean_reward']:.3f}, success={result['success_rate']:.2f}", flush=True)
                 if hasattr(model, "_logger"):
                     model.logger.record("evaluation/mean_reward", result["mean_reward"])
                     model.logger.record("evaluation/success_rate", result["success_rate"])
+                    model.logger.record("train/optimizer_steps_actual", optimizer_step_count(model))
                     model.logger.dump(step=model.num_timesteps)
-                last_eval = model.num_timesteps
-                next_eval = model.num_timesteps + args.ppo_eval_steps
+                last_eval, next_eval = model.num_timesteps, model.num_timesteps + args.ppo_eval_steps
+            runtime = {"warmup_until": warmup_until, "best_validation": best_result}
             if best_state is not None:
                 for path in {run_dir / "a2c.model", Path(args.model_path).resolve()}:
                     atomic_save(agent_from_state(best_state), path)
-            save_ppo_checkpoint(model, env, args, best_state, best_score, confirmed, run_dir / "checkpoint.pt")
+            if improved:
+                save_ppo_checkpoint(model, env, args, best_state, best_score, confirmed, run_dir / "best-checkpoint.pt", runtime)
+            save_ppo_checkpoint(model, env, args, best_state, best_score, confirmed, run_dir / "checkpoint.pt", runtime)
+            atomic_json({"steps": int(model.num_timesteps), "optimizer_steps": optimizer_step_count(model),
+                         "epochs_attempted": int(model._n_updates), "best_reward": best_score,
+                         "pid": os.getpid(), "status": "running"}, run_dir / "progress.json")
 
-        # SB3 calls rollout_start after the preceding rollout's optimizer updates finish.
         class SaveAtBoundary(BaseCallback):
             def _on_rollout_start(self):
                 boundary()
-                if stop.requested or confirmed:
+                if stop.requested or (args.stop_file and Path(args.stop_file).exists()) or confirmed or (args.defer_confirmation and validation_goal):
                     raise Finished
+                set_ppo_actor_trainable(model, model.num_timesteps >= warmup_until)
+                env.training = model.num_timesteps >= warmup_until  # Keep warm-up policy inputs fixed too.
 
             def _on_step(self):
                 for info in self.locals.get("infos", []):
                     if "episode" in info:
-                        row = {"steps": int(model.num_timesteps), **info["episode"]}
                         with (run_dir / "episodes.jsonl").open("a", encoding="utf-8") as output:
-                            output.write(json.dumps(row) + "\n")
+                            output.write(json.dumps({"steps": int(model.num_timesteps), **info["episode"]}) + "\n")
                 return True
 
         with StopRequest() as stop:
@@ -1334,18 +1512,468 @@ def run_ppo_training(args):
             except Finished:
                 pass
             boundary(force=True)
-        result = evaluate_agent(agent_from_state(best_state), args.eval_seeds)
-        result.update(steps=int(model.num_timesteps), validation_and_confirmation_passed=confirmed,
-                      target_reward=args.target_reward,
-                      example_set_passed=result["mean_reward"] >= args.target_reward and result["success_rate"] == 1.0)
-        (run_dir / "final-evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print(json.dumps(result, indent=2), flush=True)
-        print(f"Saved {run_dir / 'checkpoint.pt'}. Goal confirmed: {confirmed}; example-set pass: {result['example_set_passed']}", flush=True)
+        interrupted = stop.requested or bool(args.stop_file and Path(args.stop_file).exists())
+        result = {"status": "interrupted" if interrupted else "completed", "steps": int(model.num_timesteps),
+                  "new_steps_this_process": int(model.num_timesteps) - initial_steps,
+                  "optimizer_steps": optimizer_step_count(model), "epochs_attempted": int(model._n_updates),
+                  "best_validation": best_result, "wall_seconds_this_process": time.monotonic() - started}
+        atomic_json(result, run_dir / "stage-result.json")
+        if not args.defer_confirmation:
+            evaluation = evaluate_agent(agent_from_state(best_state), args.eval_seeds)
+            evaluation.update(steps=int(model.num_timesteps), validation_and_confirmation_passed=confirmed,
+                              target_reward=args.target_reward, example_set_passed=target_passed(evaluation, args.target_reward))
+            atomic_json(evaluation, run_dir / "final-evaluation.json")
+            print(json.dumps(evaluation, indent=2), flush=True)
+        print(f"Saved {run_dir / 'checkpoint.pt'} and best-checkpoint.pt. Status: {result['status']}", flush=True)
+        return result
     finally:
         env.close()
         if "model" in locals() and hasattr(model, "_logger"):
             for output in model.logger.output_formats:
                 output.close()
+
+
+# Identify the exact source and baseline used by every campaign stage.
+def file_sha256(path, normalize_newlines=False):
+    data = Path(path).read_bytes()
+    if normalize_newlines:
+        data = data.replace(b"\r\n", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
+def campaign_spec(args):
+    rollout = args.num_envs * args.ppo_rollout_steps
+    return {"version": 1, "source_lf_sha256": file_sha256(__file__, True),
+            "baseline_sha256": BASELINE_SHA256, "budget": args.campaign_budget // rollout * rollout,
+            "pilot_steps": args.pilot_steps // rollout * rollout, "chunk_steps": args.chunk_steps // rollout * rollout,
+            "rollout": rollout, "num_envs": args.num_envs, "device": args.device,
+            "torch_threads": args.torch_threads, "seed": args.seed, "replication_seed": args.seed + 1000,
+            "validation_seeds": CAMPAIGN_VALIDATION_SEEDS, "selection_seeds": CAMPAIGN_SELECTION_SEEDS,
+            "confirmation_seeds": list(args.confirmation_seeds), "example_seeds": list(args.eval_seeds),
+            "target": args.target_reward, "gammas": [0.99, 0.999],
+            "learning_rate": [1e-4, 2.5e-5], "clip_range": [0.2, 0.1], "batch_size": 256,
+            "minimum_reward_gain": 10.0, "minimum_progress_gain": 0.05,
+            "plateau_chunks": 3, "maximum_recovery_chunks": 2}
+
+
+# Fetch only the user's pinned release artifact, verifying its digest before loading it.
+def campaign_baseline(root, supplied=None):
+    path = Path(root) / "baseline" / "a2c.model"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        if supplied:
+            if file_sha256(supplied) != BASELINE_SHA256:
+                raise ValueError("Baseline does not match the pinned Issue #2 release model.")
+            shutil.copy2(supplied, path)
+        else:
+            temporary = path.with_suffix(".download")
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(BASELINE_URL, timeout=30) as response, temporary.open("wb") as output:
+                        shutil.copyfileobj(response, output)
+                    if file_sha256(temporary) != BASELINE_SHA256:
+                        raise ValueError("Downloaded baseline SHA-256 mismatch.")
+                    os.replace(temporary, path)
+                    break
+                except OSError:
+                    temporary.unlink(missing_ok=True)
+                    if attempt == 2:
+                        raise
+    if file_sha256(path) != BASELINE_SHA256:
+        raise ValueError("Cached baseline SHA-256 mismatch; preserve it and inspect the file.")
+    return path.resolve()
+
+
+# Compare common development seeds; all scores remain original environment returns.
+def evaluation_summary(result):
+    diagnostics = result.get("diagnostics", [])
+    progress = [row["progress_fraction"] for row in diagnostics]
+    stalls = [row.get("stall_fraction", 0.0) for row in diagnostics]
+    return {"mean_reward": float(result["mean_reward"]), "success_rate": float(result["success_rate"]),
+            "mean_progress": float(np.mean(progress)) if progress else 0.0,
+            "median_progress": float(np.median(progress)) if progress else 0.0,
+            "stall_fraction": float(np.mean(stalls)) if stalls else 0.0}
+
+
+def candidate_key(candidate):
+    score = candidate["score"]
+    target = candidate.get("target", 300.0)
+    passed = target_passed(score, target) and target_passed(candidate["validation"], target)
+    return (passed, score["mean_reward"], score["success_rate"], score["median_progress"], -score["stall_fraction"])
+
+
+def improves_baseline(candidate, baseline, spec):
+    score, base = candidate["score"], baseline["score"]
+    return (score["mean_reward"] >= base["mean_reward"] + spec["minimum_reward_gain"] and
+            (score["success_rate"] > base["success_rate"] or
+             score["mean_progress"] >= base["mean_progress"] + spec["minimum_progress_gain"]))
+
+
+def campaign_spent(manifest):
+    return sum(stage.get("steps", 0) + stage.get("lost_steps_upper_bound", 0) for stage in manifest["stages"].values())
+
+
+# Run one child under the current interpreter; stdout and stderr remain in its stage log.
+def execute_campaign_stage(command, stage_dir, stop, stop_file):
+    stage_dir = Path(stage_dir)
+    with (stage_dir / "console.log").open("a", encoding="utf-8") as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+        atomic_json({"pid": process.pid, "started": datetime.now().isoformat(), "command": command}, stage_dir / "process.json")
+        last_report = 0.0
+        while process.poll() is None:
+            if stop.requested:
+                Path(stop_file).touch()
+            if time.monotonic() - last_report >= 30:
+                progress = stage_dir / "progress.json"
+                if progress.exists():
+                    print(f"{stage_dir.name}: {progress.read_text(encoding='utf-8')}", flush=True)
+                last_report = time.monotonic()
+            time.sleep(0.5)
+        return process.returncode
+
+
+# Keep Windows awake during the campaign without changing its permanent power settings.
+@contextmanager
+def campaign_awake():
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+    try:
+        yield
+    finally:
+        if os.name == "nt":
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+
+
+# Persist stage intentions before launch, then resume only their own completed-update checkpoint.
+class Campaign:
+    def __init__(self, root, spec, baseline_path, manifest, stop):
+        self.root, self.spec = Path(root), spec
+        self.baseline_path, self.manifest, self.stop = Path(baseline_path), manifest, stop
+
+
+    def save(self):
+        self.manifest["charged_steps_upper_bound"] = campaign_spent(self.manifest)
+        atomic_json(self.manifest, self.root / "campaign.json")
+
+
+    def assess(self, model_path, output_path):
+        output_path = Path(output_path)
+        digest = file_sha256(model_path)
+        if output_path.exists():
+            saved = json.loads(output_path.read_text(encoding="utf-8"))
+            if saved["model_sha256"] != digest:
+                raise ValueError("A model changed after its selection evaluation.")
+            return saved["evaluation"]
+        agent = torch.load(model_path, map_location="cpu", weights_only=True)
+        result = evaluate_agent(agent, self.spec["selection_seeds"])
+        atomic_json({"model_sha256": digest, "evaluation": result}, output_path)
+        return result
+
+
+    def stage(self, name, gamma, seed, requested_steps, parent=None, recovery=False):
+        spec = self.spec
+        directory = self.root / "stages" / name
+        existing = self.manifest["stages"].get(name)
+        if existing and existing["status"] == "completed":
+            return existing["candidate"]
+        if self.stop.requested or (self.root / "STOP").exists():
+            raise InterruptedError("Campaign stop requested.")
+        if existing is None:
+            allocation = min(requested_steps, spec["budget"] - campaign_spent(self.manifest))
+            allocation = allocation // spec["rollout"] * spec["rollout"]
+            if allocation < spec["rollout"]:
+                return None
+            existing = {"name": name, "gamma": gamma, "seed": seed, "allocation": allocation,
+                        "steps": 0, "lost_steps_upper_bound": 0, "status": "pending", "recovery": recovery,
+                        "parent_checkpoint": parent["checkpoint"] if parent else None,
+                        "lr_start": 5e-5 if recovery else 1e-4, "lr_end": 2.5e-5,
+                        "clip_start": 0.15 if recovery else 0.2, "clip_end": 0.1}
+            if parent:
+                # Continuation never restarts at a larger learning rate after selecting an earlier best.
+                previous = read_ppo_checkpoint(parent["checkpoint"])
+                phase = min(1.0, previous["steps"] / max(1, previous["config"]["steps"]))
+                config = previous["config"]
+                previous_lr = max(config["ppo_final_lr"], config["ppo_learning_rate"] + phase * (config["ppo_final_lr"] - config["ppo_learning_rate"]))
+                previous_clip = max(config["ppo_final_clip"], config["ppo_clip_range"] + phase * (config["ppo_final_clip"] - config["ppo_clip_range"]))
+                existing["lr_end"] = 1e-5 if recovery else min(2.5e-5, config["ppo_final_lr"])
+                existing["lr_start"] = max(existing["lr_end"], previous_lr * (0.5 if recovery else 1.0))
+                existing["clip_start"] = max(0.1, min(0.15 if recovery else 0.2, previous_clip))
+            self.manifest["stages"][name] = existing
+            self.save()
+        directory.mkdir(parents=True, exist_ok=True)
+        # A surviving child may outlive its parent; its own lock prevents duplicate training.
+        with file_lock(directory / "run.lock"):
+            checkpoint_path = directory / "checkpoint.pt"
+            result_path = directory / "stage-result.json"
+            finished = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
+            if finished and finished["status"] == "completed":
+                existing["steps"] = finished["steps"]
+            else:
+                checkpoint = read_ppo_checkpoint(checkpoint_path) if checkpoint_path.exists() else None
+                existing["steps"] = checkpoint["steps"] if checkpoint else 0
+                if existing["status"] == "running" and not finished:
+                    # A hard crash may discard at most the in-flight rollout beyond this checkpoint.
+                    remaining = existing["allocation"] - existing["steps"] - existing["lost_steps_upper_bound"]
+                    existing["lost_steps_upper_bound"] += min(spec["rollout"], max(0, remaining))
+                existing["status"] = "pending"
+                self.save()
+        if not finished or finished["status"] != "completed":
+            goal = existing["allocation"] - existing["lost_steps_upper_bound"]
+            if goal == 0 and not checkpoint_path.exists():
+                raise RuntimeError("No complete checkpoint survived this stage. Start a new campaign; budget was reserved conservatively.")
+            if checkpoint_path.exists() and existing["steps"] == goal:
+                checkpoint = read_ppo_checkpoint(checkpoint_path)
+                finished = {"status": "completed", "steps": goal,
+                            "best_validation": checkpoint["runtime"]["best_validation"]}
+                atomic_json(finished, result_path)
+        if not finished or finished["status"] != "completed":
+            command = [sys.executable, "-u", str(Path(__file__).resolve()), "--mode", "train", "--algorithm", "ppo",
+                       "--device", spec["device"], "--num-envs", str(spec["num_envs"]), "--torch-threads", str(spec["torch_threads"]),
+                       "--run-dir", str(directory), "--model-path", str(directory / "a2c.model"), "--steps", str(goal),
+                       "--seed", str(seed), "--gamma", str(gamma), "--ppo-rollout-steps", str(spec["rollout"] // spec["num_envs"]),
+                       "--ppo-batch-size", str(spec["batch_size"]), "--ppo-eval-steps", str(max(spec["rollout"], 250000)),
+                       "--ppo-learning-rate", str(existing["lr_start"]), "--ppo-final-lr", str(existing["lr_end"]),
+                       "--ppo-clip-range", str(existing["clip_start"]), "--ppo-final-clip", str(existing["clip_end"]),
+                       "--ppo-target-kl", "0.02", "--defer-confirmation", "--target-reward", str(spec["target"]),
+                       "--stop-file", str(self.root / "STOP"), "--validation-seeds", *map(str, spec["validation_seeds"]),
+                       "--confirmation-seeds", *map(str, spec["confirmation_seeds"]), "--eval-seeds", *map(str, spec["example_seeds"])]
+            if checkpoint_path.exists():
+                command += ["--resume", str(checkpoint_path)]
+            elif existing["parent_checkpoint"]:
+                command += ["--init-checkpoint", existing["parent_checkpoint"]]
+            else:
+                command += ["--warm-start", str(self.baseline_path)]
+                if gamma != 0.99:
+                    command += ["--reset-critic", "--critic-warmup-rollouts", "8"]
+            existing["status"] = "running"
+            existing["command"] = command
+            self.save()
+            # Remove an old interruption result only after it has been accounted for.
+            result_path.unlink(missing_ok=True)
+            print(f"Starting {name}: gamma={gamma}, seed={seed}, stage budget={goal}.", flush=True)
+            code = execute_campaign_stage(command, directory, self.stop, self.root / "STOP")
+            if not result_path.exists():
+                raise RuntimeError(f"Stage {name} exited {code} without a complete result. See {directory / 'console.log'}.")
+            finished = json.loads(result_path.read_text(encoding="utf-8"))
+            existing["steps"] = finished["steps"]
+            if finished["status"] == "interrupted" or code == 130:
+                existing["status"] = "interrupted"
+                self.save()
+                raise InterruptedError("Stage saved at a complete update boundary.")
+            if code != 0:
+                raise RuntimeError(f"Stage {name} failed with exit code {code}.")
+        if existing["steps"] + existing["lost_steps_upper_bound"] > existing["allocation"]:
+            raise RuntimeError("Stage exceeded its reserved budget.")
+        result = self.assess(directory / "a2c.model", directory / "selection.json")
+        candidate = {"name": name, "gamma": gamma, "seed": seed, "target": spec["target"], "score": evaluation_summary(result),
+                     "model": str(directory / "a2c.model"), "checkpoint": str(directory / "best-checkpoint.pt"),
+                     "validation": finished["best_validation"]}
+        existing.update(status="completed", candidate=candidate)
+        self.save()
+        return candidate
+
+
+# Select on development seeds, replicate the configuration, then continue the best complete state.
+def campaign_search(campaign, baseline):
+    spec = campaign.spec
+    candidates = []
+    for gamma, name in ((0.99, "g099"), (0.999, "g0999")):
+        candidate = campaign.stage(f"pilot-{name}", gamma, spec["seed"], spec["pilot_steps"])
+        if candidate is not None:
+            candidates.append(candidate)
+    qualified = [c for c in candidates if improves_baseline(c, baseline, spec)]
+    if not qualified:
+        for candidate in list(candidates):
+            recovered = campaign.stage(f"recovery-{candidate['name']}", candidate["gamma"], spec["seed"],
+                                       spec["chunk_steps"], parent=candidate, recovery=True)
+            if recovered is not None:
+                candidates.append(recovered)
+        qualified = [c for c in candidates if improves_baseline(c, baseline, spec)]
+    champion = max([baseline, *candidates], key=candidate_key)
+    # At most one replication per gamma; the new seed starts from the same release baseline.
+    tried = set()
+    replicated = None
+    for candidate in sorted(qualified, key=candidate_key, reverse=True):
+        if candidate["gamma"] in tried:
+            continue
+        tried.add(candidate["gamma"])
+        replica = campaign.stage(f"replicate-{candidate['gamma']}", candidate["gamma"], spec["replication_seed"], spec["pilot_steps"])
+        if replica is not None:
+            champion = max([champion, replica], key=candidate_key)
+            if improves_baseline(replica, baseline, spec):
+                replicated = max([candidate, replica], key=candidate_key)
+                break
+    if replicated is None:
+        return champion, "no_replicated_improvement"
+    champion = replicated
+    plateau, recovery_count, index = 0, 0, 0
+    while not (target_passed(champion["score"], spec["target"]) and target_passed(champion["validation"], spec["target"])):
+        index += 1
+        recovery = plateau >= spec["plateau_chunks"]
+        if recovery and recovery_count >= spec["maximum_recovery_chunks"]:
+            return champion, "plateau_after_bounded_recovery"
+        candidate = campaign.stage(f"continue-{index:03d}", champion["gamma"], spec["seed"] + 2000 + index,
+                                   spec["chunk_steps"], parent=champion, recovery=recovery)
+        if candidate is None:
+            return champion, "budget_exhausted"
+        old = champion["score"]
+        meaningful = (candidate["score"]["mean_reward"] >= old["mean_reward"] + 5.0 or
+                      (candidate["score"]["success_rate"] > old["success_rate"] and candidate_key(candidate) > candidate_key(champion)))
+        if candidate_key(candidate) > candidate_key(champion):
+            champion = candidate
+        plateau = 0 if meaningful else plateau + 1
+        if recovery:
+            recovery_count += 1
+    return champion, "development_target_reached"
+
+
+# Produce real curves from each stage's original rewards, with no synthesized training data.
+def campaign_plots(root):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    for directory in sorted((Path(root) / "stages").glob("*")):
+        fig, axes = plt.subplots(2, 1, figsize=(9, 6), constrained_layout=True)
+        for filename, axis, field in (("episodes.jsonl", axes[0], "r"), ("evaluations.jsonl", axes[1], "mean_reward")):
+            path = directory / filename
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+            values = np.asarray([row[field] for row in rows], dtype=float)
+            if len(values):
+                axis.plot([row["steps"] for row in rows], values, alpha=0.35, linewidth=0.6)
+                window = min(100, len(values)) if field == "r" else 1
+                smoothed = np.convolve(values, np.ones(window) / window, mode="valid")
+                axis.plot([row["steps"] for row in rows][window - 1:], smoothed, linewidth=1)
+            axis.set_ylabel("Raw episode return" if field == "r" else "Validation mean")
+            axis.set_xlabel("Stage environment steps")
+            axis.grid(alpha=0.2)
+        fig.suptitle(directory.name)
+        fig.savefig(directory / "reward-curves.png", dpi=140)
+        plt.close(fig)
+
+
+# Freeze the final choice before opening holdout results; a failed holdout never selects another model.
+def finish_campaign(campaign, champion, reason):
+    root, spec, manifest = campaign.root, campaign.spec, campaign.manifest
+    locked_path = root / "final-choice.json"
+    choice = {"candidate": champion, "model_sha256": file_sha256(champion["model"]), "reason": reason}
+    if locked_path.exists():
+        if json.loads(locked_path.read_text(encoding="utf-8")) != choice:
+            raise ValueError("The final choice was already frozen; holdout results must not select another candidate.")
+    else:
+        atomic_json(choice, locked_path)
+    shutil.copy2(champion["model"], root / "a2c.model")
+    agent = torch.load(root / "a2c.model", map_location="cpu", weights_only=True)
+    results = {}
+    for name, seeds in (("confirmation", spec["confirmation_seeds"]), ("example", spec["example_seeds"])):
+        path = root / f"{name}-evaluation.json"
+        if path.exists():
+            result = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            result = evaluate_agent(agent, seeds)
+            result["model_sha256"] = choice["model_sha256"]
+            atomic_json(result, path)
+        if result["model_sha256"] != choice["model_sha256"] or result["seeds"] != seeds:
+            raise ValueError("Final evaluation provenance does not match the frozen model and seeds.")
+        results[name] = result
+    with tempfile.TemporaryDirectory() as directory:
+        check_fresh_process(agent, directory)
+    passed = (target_passed(champion["score"], spec["target"]) and
+              target_passed(champion["validation"], spec["target"]) and
+              all(target_passed(result, spec["target"]) for result in results.values()))
+    summary = {"goal_reached": passed, "target_reward": spec["target"], "stop_reason": reason,
+               "selected_candidate": champion, "charged_steps_upper_bound": campaign_spent(manifest),
+               "completed_update_steps": sum(s["steps"] for s in manifest["stages"].values()),
+               "lost_steps_upper_bound": sum(s["lost_steps_upper_bound"] for s in manifest["stages"].values()),
+               "evaluations": results, "teacher_interface_verified": True}
+    atomic_json(summary, root / "final-evaluation.json")
+    submission = root / "submission"
+    submission.mkdir(exist_ok=True)
+    shutil.copy2(__file__, submission / "train.py")
+    shutil.copy2(root / "a2c.model", submission / "a2c.model")
+    with zipfile.ZipFile(root / "submission.zip", "w", zipfile.ZIP_DEFLATED) as output:
+        for name in ("train.py", "a2c.model"):
+            output.write(submission / name, name)
+    campaign_plots(root)
+    dependencies = subprocess.run([sys.executable, "-m", "pip", "freeze"], text=True, capture_output=True, check=True)
+    (root / "dependencies.txt").write_text(dependencies.stdout, encoding="utf-8")
+    lines = ["# Campaign results", "", f"Goal reached on specified seeds: **{passed}**", f"Stop reason: {reason}",
+             f"Selected candidate: {champion['name']}", f"Source LF SHA-256: {spec['source_lf_sha256']}",
+             f"Model SHA-256: {choice['model_sha256']}", f"Completed-update steps: {summary['completed_update_steps']}",
+             f"Additional discarded-step upper bound: {summary['lost_steps_upper_bound']}",
+             f"Charged budget: {summary['charged_steps_upper_bound']} / {spec['budget']}", "",
+             "| Stage | Gamma | Seed | Steps | Selection mean | Success rate |", "| --- | --- | --- | --- | --- | --- |"]
+    for stage in manifest["stages"].values():
+        score = stage["candidate"]["score"]
+        lines.append(f"| {stage['name']} | {stage['gamma']} | {stage['seed']} | {stage['steps']} | {score['mean_reward']:.3f} | {score['success_rate']:.3f} |")
+    for name, result in results.items():
+        lines += ["", f"{name}: mean={result['mean_reward']:.3f}; success={result['success_rate']:.3f}",
+                  f"Seeds: {result['seeds']}", f"Rewards: {result['rewards']}", f"Lengths: {result['lengths']}"]
+    lines += ["", "Raw rewards; Hardcore; 1600-step limit. No score guarantee on unseen teacher seeds.",
+              "PPO/GAE and observation normalization extend the course A2C example; references are in README.md.",
+              "Training optimizer updates occurred on this Windows machine; local development checks did not train.",
+              "Each stage contains its own latest and best complete checkpoint, console log, evaluations and reward curve."]
+    (root / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    manifest.update(status="completed", goal_reached=passed, stop_reason=reason,
+                    selected_candidate=champion, finished=datetime.now().isoformat())
+    campaign.save()
+    with zipfile.ZipFile(root / "diagnostics.zip", "w", zipfile.ZIP_DEFLATED) as output:
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.suffix not in {".pt", ".model", ".zip", ".lock", ".tmp"} and "submission" not in path.parts:
+                output.write(path, str(path.relative_to(root)))
+    print(json.dumps(summary, indent=2), flush=True)
+    print(f"Campaign completed. Goal reached: {passed}. Deliverables: {root}", flush=True)
+    return summary
+
+
+# One command owns pilots, replication, bounded continuation, final evaluation and packaging.
+def run_campaign(args):
+    spec = campaign_spec(args)
+    if args.dry_run:
+        print(json.dumps(spec, indent=2))
+        return spec
+    root = Path(args.campaign_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with file_lock(root / "campaign.lock"), campaign_awake(), StopRequest() as stop:
+        path = root / "campaign.json"
+        manifest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+            "spec": spec, "status": "created", "stages": {}, "started": datetime.now().isoformat(),
+            "platform": platform.platform(), "python": platform.python_version(), "torch": str(torch.__version__),
+            "gymnasium": gym.__version__, "numpy": np.__version__}
+        if manifest["spec"] != spec:
+            raise ValueError("Campaign source or protocol changed. Restore its exact source/options or use a new campaign directory.")
+        required = ["final-evaluation.json", "submission.zip", "diagnostics.zip", "RESULTS.md", "dependencies.txt", "a2c.model"]
+        if manifest["status"] == "completed" and all((root / name).is_file() for name in required):
+            result = json.loads((root / "final-evaluation.json").read_text(encoding="utf-8"))
+            print(json.dumps(result, indent=2))
+            return result
+        # Reissuing the same command explicitly resumes a previously requested stop.
+        (root / "STOP").unlink(missing_ok=True)
+        baseline_path = campaign_baseline(root, args.campaign_baseline)
+        campaign = Campaign(root, spec, baseline_path, manifest, stop)
+        manifest["status"] = "running"
+        campaign.save()
+        try:
+            selection = campaign.assess(baseline_path, root / "baseline-selection.json")
+            baseline = {"name": "release-baseline", "gamma": 0.99, "seed": None, "target": spec["target"], "model": str(baseline_path),
+                        "checkpoint": None, "score": evaluation_summary(selection), "validation": selection}
+            if (root / "final-choice.json").exists():
+                frozen = json.loads((root / "final-choice.json").read_text(encoding="utf-8"))
+                champion, reason = frozen["candidate"], frozen["reason"]
+            else:
+                champion, reason = campaign_search(campaign, baseline)
+            if stop.requested:
+                raise InterruptedError("Campaign interrupted before final evaluation.")
+            return finish_campaign(campaign, champion, reason)
+        except InterruptedError:
+            manifest["status"] = "interrupted"
+            campaign.save()
+            print(f"Campaign interrupted safely. Resume with the same command: {root}", flush=True)
+            return {"status": "interrupted"}
+        except Exception as error:
+            manifest.update(status="failed", error=repr(error))
+            campaign.save()
+            raise
 
 
 # Verify PPO export and resume without ever calling learn or an optimizer step.
@@ -1368,6 +1996,26 @@ def check_ppo(args):
             state = env.get_original_obs()[0]
             expected, _ = model.predict(env.normalize_obs(state[None, :]), deterministic=True)
             np.testing.assert_allclose(exported.select_action(state, eval=True), expected[0], atol=1e-6)
+            # A longer discount horizon gets a fresh critic while retaining exactly the same initial policy.
+            warm = PPO("MlpPolicy", env, seed=args.seed + 1, gamma=0.999, n_steps=8, batch_size=8, device=args.device,
+                       policy_kwargs={"activation_fn": nn.Tanh, "net_arch": {"pi": [256, 256], "vf": [256, 256]}})
+            warm_start_ppo(warm, env, exported, reset_critic=True)
+            warm_action, _ = warm.predict(env.normalize_obs(state[None, :]), deterministic=True)
+            np.testing.assert_array_equal(warm_action, expected)
+            assert not torch.equal(warm.policy.value_net.weight, model.policy.value_net.weight)
+            set_ppo_actor_trainable(warm, False)
+            inputs = torch.as_tensor(env.normalize_obs(state[None, :]), device=warm.device)
+            warm.policy.predict_values(inputs).sum().backward()
+            assert warm.policy.action_net.weight.grad is None and warm.policy.log_std.grad is None
+            assert warm.policy.value_net.weight.grad is not None
+            set_ppo_actor_trainable(warm, True)
+            assert warm.policy.action_net.weight.requires_grad and warm.policy.log_std.requires_grad
+            assert optimizer_step_count(warm) == 0
+            try:
+                warm_start_ppo(warm, env, exported, reset_critic=False)
+                raise AssertionError("A changed gamma reused the old critic silently")
+            except ValueError:
+                pass
             with tempfile.TemporaryDirectory() as folder:
                 check_fresh_process(exported, folder)
                 destination = Path(folder) / "checkpoint.pt"
@@ -1376,6 +2024,7 @@ def check_ppo(args):
                         model.policy.optimizer.state[parameter] = {"step": torch.tensor(7.0),
                                                                    "exp_avg": torch.zeros_like(parameter),
                                                                    "exp_avg_sq": torch.ones_like(parameter)}
+                model.num_timesteps = 32  # Synthetic counter, not collected training data.
                 save_ppo_checkpoint(model, env, args, exported.__getstate__(), -100.0, False, destination)
                 state = torch.load(destination, weights_only=True)
                 restored = PPO.load(io.BytesIO(state["model_zip"].numpy().tobytes()), env=env, device=args.device)
@@ -1402,11 +2051,42 @@ def check_ppo(args):
                     checkpoint_path = next((Path(folder) / "runs").rglob("checkpoint.pt"))
                     checkpoint = torch.load(checkpoint_path, weights_only=True)
                     assert checkpoint["steps"] == 8 and not checkpoint["confirmed"]
+                    best_checkpoint = torch.load(checkpoint_path.with_name("best-checkpoint.pt"), weights_only=True)
+                    assert best_checkpoint["steps"] == 0  # Equal scores keep the earlier complete best state.
                     test_args.resume = str(checkpoint_path)
                     test_args.steps = 16
                     run_ppo_training(test_args)
                 saved = [torch.load(p, weights_only=True)["steps"] for p in (Path(folder) / "runs").rglob("checkpoint.pt")]
                 assert sorted(saved) == [8, 16]
+                init_args = parse_args(["--algorithm", "ppo", "--num-envs", "1", "--steps", "8",
+                    "--ppo-rollout-steps", "8", "--ppo-batch-size", "8", "--init-checkpoint", str(destination),
+                    "--log-dir", str(Path(folder) / "continuation"), "--model-path", str(Path(folder) / "continuation.model")])
+                def continuation_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name):
+                    assert current.num_timesteps == 0 and optimizer_step_count(current) == 7
+                    assert math.isclose(current.lr_schedule(1.), init_args.ppo_learning_rate)
+                    return fake_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name)
+                with patch.object(PPO, "learn", continuation_learn), patch("train.evaluate_agent", fake_eval), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    continuation = run_ppo_training(init_args)
+                    assert continuation["steps"] == 8 and continuation["optimizer_steps"] == 7
+                warm_path = Path(folder) / "warm.model"
+                atomic_save(exported, warm_path)
+                warm_args = parse_args(["--algorithm", "ppo", "--num-envs", "1", "--steps", "16",
+                    "--ppo-rollout-steps", "8", "--ppo-batch-size", "8", "--gamma", "0.999",
+                    "--warm-start", str(warm_path), "--reset-critic", "--critic-warmup-rollouts", "1",
+                    "--log-dir", str(Path(folder) / "warmup"), "--model-path", str(Path(folder) / "warmup.model")])
+                def warmup_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name):
+                    callback.model = current
+                    callback._on_rollout_start()
+                    assert not current.policy.action_net.weight.requires_grad and not current.get_env().training
+                    current.num_timesteps += 8
+                    callback._on_rollout_start()
+                    assert current.policy.action_net.weight.requires_grad and current.get_env().training
+                    current.num_timesteps += 8
+                    return current
+                with patch.object(PPO, "learn", warmup_learn), patch("train.evaluate_agent", fake_eval), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    run_ppo_training(warm_args)
                 for confirmation_passes in (False, True):
                     test_args.resume = None
                     test_args.steps = 8
@@ -1428,14 +2108,202 @@ def check_ppo(args):
     print("PASS: PPO normalized-observation export, teacher load, mocked lifecycle/goal checks and checkpoint round trip. Optimizer steps: 0.")
 
 
+# Exercise all campaign transitions with synthetic results and a learner that never trains.
+def check_campaign():
+    import contextlib
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as directory, \
+            patch.object(torch.optim.Adam, "step", side_effect=AssertionError("No optimizer steps in checks")):
+        root = Path(directory)
+        args = parse_args(["--algorithm", "ppo", "--num-envs", "1", "--steps", "16",
+                           "--ppo-rollout-steps", "8", "--ppo-batch-size", "8"])
+        args.pilot_steps, args.chunk_steps, args.campaign_budget = 16, 16, 128
+        spec = campaign_spec(args)
+        spec["batch_size"] = 8
+        baseline_agent = Agent({"hidden_dim": 256, "activation": "tanh"})
+        baseline_path = root / "baseline.model"
+        atomic_save(baseline_agent, baseline_path)
+        base_score = {"mean_reward": 0., "success_rate": 0., "mean_progress": 0.1,
+                      "median_progress": 0.1, "stall_fraction": 0.8}
+        baseline = {"name": "baseline", "gamma": 0.99, "seed": None, "score": base_score,
+                    "model": str(baseline_path), "checkpoint": None, "validation": base_score}
+        commands = []
+        scores = {"pilot-g099": (20., 0.3), "pilot-g0999": (40., 0.4), "replicate-0.999": (30., 0.3),
+                  "continue-001": (280., 0.9), "continue-002": (310., 1.0)}
+
+        def result_for(name, seeds=None):
+            reward, progress = scores.get(name, (0., 0.1))
+            seeds = list(seeds or spec["selection_seeds"])
+            return {"seeds": seeds, "rewards": [reward] * len(seeds), "lengths": [100] * len(seeds),
+                    "mean_reward": reward, "std_reward": 0., "success_rate": float(progress == 1.),
+                    "diagnostics": [{"progress_fraction": progress, "stall_fraction": 1. - progress}] * len(seeds)}
+
+        def fake_execute(command, stage_dir, stop, stop_file):
+            current = parse_args(command[3:])
+            commands.append(current)
+            stage_dir = Path(stage_dir)
+            agent = Agent({"hidden_dim": 256, "activation": "tanh", "gamma": current.gamma})
+            atomic_save(agent, stage_dir / "a2c.model")
+            saved = {"kind": "ppo_training_checkpoint", "format_version": FORMAT_VERSION,
+                     "steps": current.steps, "config": vars(current), "runtime": {"warmup_until": 0}}
+            atomic_save(saved, stage_dir / "checkpoint.pt")
+            atomic_save(saved, stage_dir / "best-checkpoint.pt")
+            atomic_json({"status": "completed", "steps": current.steps,
+                         "best_validation": result_for(stage_dir.name, spec["validation_seeds"])}, stage_dir / "stage-result.json")
+            return 0
+
+        def fake_assess(current, model_path, output_path):
+            return result_for(Path(model_path).parent.name)
+
+        def make_campaign(name):
+            destination = root / name
+            destination.mkdir()
+            return Campaign(destination, spec.copy(), baseline_path, {"spec": spec.copy(), "stages": {}}, SimpleNamespace(requested=False))
+
+        with patch("train.execute_campaign_stage", fake_execute), patch.object(Campaign, "assess", fake_assess), \
+                contextlib.redirect_stdout(io.StringIO()):
+            campaign = make_campaign("success")
+            champion, reason = campaign_search(campaign, baseline)
+            assert reason == "development_target_reached" and champion["name"] == "continue-002"
+            assert len(commands) == 5 and campaign_spent(campaign.manifest) == 80
+            assert commands[1].reset_critic and commands[1].critic_warmup_rollouts == 8
+            assert commands[2].seed == 1543 and commands[2].warm_start and not commands[2].init_checkpoint
+            assert commands[3].init_checkpoint.endswith("best-checkpoint.pt")
+            assert commands[4].ppo_learning_rate <= commands[3].ppo_learning_rate
+            repeated, _ = campaign_search(campaign, baseline)
+            assert repeated == champion and len(commands) == 5  # A restart never repeats a completed stage.
+
+            # A failed holdout is reported without selecting a different policy or continuing training.
+            calls = []
+            def fake_final_eval(agent, seeds):
+                calls.append(list(seeds))
+                result = result_for("continue-002", seeds)
+                if list(seeds) == spec["confirmation_seeds"]:
+                    result["mean_reward"] = 200.
+                    result["rewards"] = [200.] * len(seeds)
+                return result
+            with patch("train.evaluate_agent", fake_final_eval), patch("train.check_fresh_process"), \
+                    patch("train.campaign_plots"), patch("train.subprocess.run", return_value=SimpleNamespace(stdout="test dependencies\n")):
+                final = finish_campaign(campaign, champion, reason)
+                assert not final["goal_reached"] and len(calls) == 2
+                finish_campaign(campaign, champion, reason)
+                assert len(calls) == 2
+                try:
+                    finish_campaign(campaign, baseline, reason)
+                    raise AssertionError("Holdout allowed a different final model")
+                except ValueError:
+                    pass
+                with zipfile.ZipFile(campaign.root / "submission.zip") as archive:
+                    assert set(archive.namelist()) == {"train.py", "a2c.model"}
+
+            # Unsuccessful pilots receive a bounded retry and never consume the entire budget blindly.
+            scores.clear()
+            stalled = make_campaign("stalled")
+            selected, reason = campaign_search(stalled, baseline)
+            assert reason == "no_replicated_improvement" and campaign_spent(stalled.manifest) == 64
+            assert len(stalled.manifest["stages"]) == 4
+
+            # A hard crash reserves one possible discarded rollout, then resumes the known boundary.
+            crashed = make_campaign("crashed")
+            stage_dir = crashed.root / "stages" / "crash"
+            stage_dir.mkdir(parents=True)
+            saved = {"kind": "ppo_training_checkpoint", "format_version": FORMAT_VERSION, "steps": 8,
+                     "config": vars(args), "runtime": {}}
+            atomic_save(saved, stage_dir / "checkpoint.pt")
+            crashed.manifest["stages"]["crash"] = {"name": "crash", "gamma": .99, "seed": 543,
+                "allocation": 24, "steps": 0, "lost_steps_upper_bound": 0, "status": "running",
+                "parent_checkpoint": None, "lr_start": 1e-4, "lr_end": 2.5e-5, "clip_start": .2, "clip_end": .1}
+            crashed.stage("crash", .99, 543, 16)
+            assert crashed.manifest["stages"]["crash"]["lost_steps_upper_bound"] == 8
+            assert commands[-1].resume and commands[-1].steps == 16
+            assert campaign_spent(crashed.manifest) == 24
+
+            # A clean interrupt preserves the unspent stage budget and resumes without charging it twice.
+            interrupted = make_campaign("interrupted")
+            first = True
+            def interrupt_once(command, stage_dir, stop, stop_file):
+                nonlocal first
+                code = fake_execute(command, stage_dir, stop, stop_file)
+                if first:
+                    first = False
+                    state = read_ppo_checkpoint(Path(stage_dir) / "checkpoint.pt")
+                    state["steps"] = 8
+                    atomic_save(state, Path(stage_dir) / "checkpoint.pt")
+                    atomic_json({"status": "interrupted", "steps": 8}, Path(stage_dir) / "stage-result.json")
+                    return 130
+                return code
+            with patch("train.execute_campaign_stage", interrupt_once):
+                try:
+                    interrupted.stage("interrupt", .99, 543, 16)
+                    raise AssertionError("Expected an interruption")
+                except InterruptedError:
+                    pass
+                interrupted.stage("interrupt", .99, 543, 16)
+            assert campaign_spent(interrupted.manifest) == 16
+            assert commands[-1].resume and commands[-1].steps == 16
+
+            # A long-running plateau has only two rollback attempts before a truthful stop.
+            scores.update({"pilot-g099": (20., .3), "pilot-g0999": (30., .4), "replicate-0.999": (25., .3)})
+            plateau = make_campaign("plateau")
+            plateau.spec["budget"] = 1000
+            selected, reason = campaign_search(plateau, baseline)
+            assert reason == "plateau_after_bounded_recovery"
+            assert sum(stage.get("recovery", False) for stage in plateau.manifest["stages"].values()) == 2
+            assert all(stage["steps"] + stage["lost_steps_upper_bound"] <= stage["allocation"] for stage in plateau.manifest["stages"].values())
+
+            # A small budget stops exactly at complete rollouts.
+            budgeted = make_campaign("budgeted")
+            budgeted.spec["budget"] = 64
+            _, reason = campaign_search(budgeted, baseline)
+            assert reason == "budget_exhausted" and campaign_spent(budgeted.manifest) == 64
+        with file_lock(root / "duplicate.lock"):
+            try:
+                with file_lock(root / "duplicate.lock"):
+                    raise AssertionError("Duplicate process lock was accepted")
+            except RuntimeError:
+                pass
+        assert linear_schedule(1e-4, 2.5e-5)(-1.) == 2.5e-5
+        assert math.isclose(linear_schedule(1e-4, 2.5e-5)(1.), 1e-4)
+        with patch("train.run_training", side_effect=AssertionError("Mac training guard failed")), \
+                patch("train.run_ppo_training", side_effect=AssertionError("Mac training guard failed")), \
+                patch("train.sys.platform", "darwin"):
+            for mode in ("train", "campaign"):
+                try:
+                    main(["--mode", mode])
+                    raise AssertionError("Mac training was not rejected")
+                except RuntimeError as error:
+                    assert "disabled" in str(error)
+    print("PASS: campaign pilots, selection, replication, rollback, strict budget, clean/crash resume, process locks and frozen holdout. Optimizer steps: 0.")
+
+
 # Parse explicit modes and keep training budgets consistent with vector stepping.
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="CS100709 document-based A2C; see this file's header for setup.")
-    parser.add_argument("--mode", choices=("train", "eval", "check", "benchmark"), default="train")
+    parser.add_argument("--mode", choices=("train", "eval", "check", "benchmark", "campaign"), default="train")
     parser.add_argument("--algorithm", choices=("a2c", "ppo"), default="a2c")
     parser.add_argument("--ppo-rollout-steps", type=int, default=2048)
     parser.add_argument("--ppo-batch-size", type=int, default=64)
     parser.add_argument("--ppo-eval-steps", type=int, default=100000)
+    parser.add_argument("--ppo-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--ppo-final-lr", type=float, default=2.5e-5)
+    parser.add_argument("--ppo-clip-range", type=float, default=0.2)
+    parser.add_argument("--ppo-final-clip", type=float, default=0.1)
+    parser.add_argument("--ppo-target-kl", type=float, default=0.02)
+    parser.add_argument("--ppo-epochs", type=int, default=10)
+    parser.add_argument("--warm-start", help="Import an exported PPO Agent into a new optimizer.")
+    parser.add_argument("--init-checkpoint", help="Start a new stage from a complete PPO checkpoint, retaining optimizer moments.")
+    parser.add_argument("--reset-critic", action="store_true")
+    parser.add_argument("--critic-warmup-rollouts", type=int, default=0)
+    parser.add_argument("--run-dir", help="Fixed PPO stage directory; use --resume when it already contains a run.")
+    parser.add_argument("--stop-file", help="Stop PPO at the next complete update boundary when this file exists.")
+    parser.add_argument("--defer-confirmation", action="store_true", help="Campaign stage: keep confirmation and example seeds unused.")
+    parser.add_argument("--campaign-dir", default="runs/campaign-issue2")
+    parser.add_argument("--campaign-baseline", help="Optional local copy of the pinned Issue #2 model; otherwise download it.")
+    parser.add_argument("--campaign-budget", type=int, default=100_000_000)
+    parser.add_argument("--pilot-steps", type=int, default=5_000_000)
+    parser.add_argument("--chunk-steps", type=int, default=5_000_000)
+    parser.add_argument("--dry-run", action="store_true", help="Print the campaign protocol without training, downloading or writing files.")
     parser.add_argument("--target-reward", type=float, default=300.0)
     parser.add_argument("--confirmation-seeds", type=int, nargs="+", default=list(range(201, 241, 2)))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
@@ -1461,6 +2329,13 @@ def parse_args(argv=None):
     parser.add_argument("--render", action="store_true", help="Show RGB frames in evaluation mode.")
     parser.add_argument("--benchmark-seconds", type=float, default=20.0)
     args = parser.parse_args(argv)
+    provided = sys.argv[1:] if argv is None else argv
+    if args.mode == "campaign":
+        args.algorithm = "ppo"
+        if not any(x == "--num-envs" or x.startswith("--num-envs=") for x in provided):
+            args.num_envs = 16
+        args.ppo_batch_size = 256
+        args.validation_seeds = CAMPAIGN_VALIDATION_SEEDS.copy()
     for name in ("num_envs", "torch_threads", "steps", "batch_size", "hidden_dim", "eval_freq", "save_freq", "log_interval", "return_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
@@ -1474,9 +2349,23 @@ def parse_args(argv=None):
         parser.error("Seeds must fit nonnegative 32-bit integers, with room for worker offsets.")
     if args.resume and args.mode != "train":
         parser.error("--resume is only valid in training mode.")
+    if sum(bool(x) for x in (args.resume, args.warm_start, args.init_checkpoint)) > 1:
+        parser.error("Choose only one of --resume, --warm-start and --init-checkpoint.")
+    if any((args.warm_start, args.init_checkpoint, args.reset_critic, args.run_dir, args.defer_confirmation, args.stop_file)) and (args.mode != "train" or args.algorithm != "ppo"):
+        parser.error("PPO initialization/stage options require --mode train --algorithm ppo.")
+    if args.reset_critic and (not args.warm_start or args.critic_warmup_rollouts < 1):
+        parser.error("--reset-critic requires --warm-start and positive --critic-warmup-rollouts.")
+    if args.dry_run and args.mode != "campaign":
+        parser.error("--dry-run is only valid with --mode campaign.")
     if args.render and args.mode != "eval":
         parser.error("--render is only valid in evaluation mode.")
     if args.algorithm == "ppo":
+        if args.critic_warmup_rollouts < 0 or args.ppo_epochs < 1:
+            parser.error("Invalid PPO epoch/warm-up count.")
+        if not all(math.isfinite(v) and v > 0 for v in (args.ppo_learning_rate, args.ppo_final_lr, args.ppo_target_kl)):
+            parser.error("PPO learning rates and KL threshold must be positive and finite.")
+        if not 0 < args.ppo_final_clip <= args.ppo_clip_range < 1 or args.ppo_final_lr > args.ppo_learning_rate:
+            parser.error("PPO schedules must decay to positive floors; clip must be below 1.")
         if min(args.ppo_rollout_steps, args.ppo_eval_steps) < 1 or args.ppo_batch_size < 2:
             parser.error("PPO needs positive rollout/evaluation sizes and batch size >= 2.")
         if args.ppo_rollout_steps * args.num_envs % args.ppo_batch_size:
@@ -1490,18 +2379,38 @@ def parse_args(argv=None):
             parser.error("PPO validation, confirmation and final evaluation seeds must be disjoint.")
         if args.mode == "benchmark":
             parser.error("The A2C benchmark does not measure PPO throughput; use observed PPO training timing.")
+    if args.mode == "campaign":
+        rollout = args.num_envs * args.ppo_rollout_steps
+        if min(args.pilot_steps, args.chunk_steps) < rollout or args.campaign_budget < 3 * args.pilot_steps:
+            parser.error("Campaign budget must cover two pilots and a replication; each stage needs a full rollout.")
+        if args.seed + 100000 >= 2**32 - args.num_envs:
+            parser.error("Campaign seed needs room for replication and continuation offsets.")
+        groups = [set(CAMPAIGN_VALIDATION_SEEDS), set(CAMPAIGN_SELECTION_SEEDS), set(args.confirmation_seeds), set(args.eval_seeds)]
+        if any(groups[i] & groups[j] for i in range(4) for j in range(i)):
+            parser.error("Campaign development, confirmation and example seeds must be disjoint.")
     return args
 
 
 # Dispatch modes only after explicit invocation of the command-line entry point.
 def main(argv=None):
     args = parse_args(argv)
+    if args.mode == "campaign" and args.dry_run:
+        run_campaign(args)
+        return 0
+    if sys.platform == "darwin" and args.mode in ("train", "campaign"):
+        raise RuntimeError("Training is disabled on the user's Mac. Use --mode check or --mode eval; train on Windows.")
+    if args.mode == "campaign" and os.name != "nt":
+        raise RuntimeError("The autonomous campaign runs on the target Windows computer.")
     configure_runtime(args)
     preflight(args)
+    if args.mode == "campaign":
+        result = run_campaign(args)
+        return 130 if result.get("status") == "interrupted" else 0
     if args.mode == "check":
         run_checks(args)
         if args.algorithm == "ppo":
             check_ppo(args)
+            check_campaign()
     elif args.mode == "benchmark":
         run_benchmark(args)
     elif args.mode == "eval":
@@ -1512,7 +2421,8 @@ def main(argv=None):
         print(json.dumps(evaluate_agent(agent, args.eval_seeds, args.render), indent=2))
     else:
         if args.algorithm == "ppo":
-            run_ppo_training(args)
+            result = run_ppo_training(args)
+            return 130 if result["status"] == "interrupted" else 0
         else:
             run_training(args)
     return 0

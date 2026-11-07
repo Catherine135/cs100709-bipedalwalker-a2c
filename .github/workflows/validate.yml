@@ -44,6 +44,9 @@ jobs:
       - name: Check multistep variant without training
         shell: pwsh
         run: conda run --no-capture-output -n cs100709 python -B train.py --mode check --device cpu --num-envs 8 --return-steps 8 --max-grad-norm 0.5
-      - name: Check PPO export and resume without training
+      - name: Check PPO warm start and autonomous campaign without training
         shell: pwsh
         run: conda run --no-capture-output -n cs100709 python -B train.py --mode check --algorithm ppo --device cpu --num-envs 8
+      - name: Print campaign plan without starting workers or training
+        shell: pwsh
+        run: conda run --no-capture-output -n cs100709 python -B train.py --mode campaign --dry-run

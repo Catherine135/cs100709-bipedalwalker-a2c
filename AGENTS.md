@@ -1,22 +1,30 @@
 # Agent handoff
 
-Read README.md first. The current user request is to improve the uploaded baseline
-as much as possible toward an original-reward score of 300. The main Windows path
-is now PPO; A2C remains a reproducible baseline. The README supersedes the earlier
-one-million-step A2C-only handoff and explains the bounded 20-million-step PPO run.
+Read README.md first. The current authorized implementation is the Issue #2
+campaign: two PPO warm-start pilots (gamma 0.99 and 0.999), development-set
+selection, independent-training-seed replication, bounded continuation/rollback,
+and a frozen final holdout. Use --mode campaign on the target Windows machine
+when instructed to train. The program owns stage selection and budget accounting;
+do not replace it with two ad hoc commands or silently extend its total budget.
 
-Reuse GWTower's validated Python environment. Add only missing PPO dependencies;
-do not reinstall PyTorch. Preserve the exact 1600-step Hardcore environment and
-raw rewards. Observation normalization is internal and exported with the Agent.
-Never train on the user's Mac; read-only model evaluation and zero-update checks
-are allowed. Reading or editing this repository alone is not a request to train.
+Reuse GWTower's validated Python environment. Install only missing dependencies;
+do not reinstall PyTorch. Preserve raw rewards and the exact 1600-step Hardcore
+environment. The reviewed public projects and their differences are in README;
+their reported scores are not this project's measured scores.
 
-Follow the README through evaluation and delivery when asked to train. Verify
-process identity before resuming; never load an A2C checkpoint as PPO. Preserve
-old runs, and do not publish new models or logs unless asked. Report measured
-scores honestly; 300 is a target, not a guarantee or a quoted course passing rule.
+Never train on the user's Mac. Only read-only evaluation, --dry-run and zero-update
+checks are allowed there. Reading/editing the repository alone is not a request
+to train. Do not call learn or optimizer.step during local validation; tests use
+synthetic outcomes and mocked learners with Adam.step blocked.
 
-Keep the single train.py deliverable and teacher Agent interface. Comments are
-English, complete modules have two blank lines between them, and standalone
-aligned comments introduce each module. Cite third-party algorithms. Run relevant
-non-training checks after changes; do not use model fitting as a local test.
+On Windows, follow the campaign through evaluation and packaging. Verify live
+processes before resuming, use the identical campaign directory/source/protocol,
+and preserve old runs. Do not use holdout scores to select another model. Report
+completed training steps separately from a crash's discarded-step upper bound.
+A completed campaign can legitimately report goal_reached=false. Do not publish
+new trained models or logs unless the user requests that separately.
+
+Keep the single train.py source deliverable and teacher Agent.select_action API.
+Comments are English; complete modules have two blank lines between them and
+aligned standalone comments. Cite third-party algorithms. Run non-training
+checks after edits and retain the original A2C route as a reproducible baseline.
