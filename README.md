@@ -1,72 +1,88 @@
-# CS100709：提高地形通关率与原始奖励的自动训练
+# CS100709：针对慢步态和动作饱和的 PPO / CAPG 自动训练
 
-**交给 Windows 电脑上的 agent：读取本 README，复用已有环境，执行 `python train.py --mode campaign --campaign-dir runs/campaign-issue3-v4`，持续跟进到评测、打包完成。** 程序自动完成普通 PPO / gSDE PPO 两组训练、独立种子复核、奖励与通关候选筛选、后续训练和最终评测。启动前执行第 3 节的进程检查、自检和协议预览；无需原聊天记录。
+**交给 Windows 电脑上的 agent：阅读本 README，复用已有 Python 环境，执行 `python train.py --mode campaign --campaign-dir runs/campaign-issue4-v5`，持续跟进至最终评测和打包。** 程序自动下载校验最新基线、完成两组试训与独立种子复核、选择后续方案、恢复中断并生成提交包。启动前先执行第 3 节的进程检查和零更新自检。
 
-公开仓库：[Catherine135/cs100709-bipedalwalker-a2c](https://github.com/Catherine135/cs100709-bipedalwalker-a2c)。教师提交物仍为单个 `train.py` 与 `a2c.model`。**本机 Mac 禁止训练，CLI 会拒绝；仅允许零更新自检、只读评测或 dry-run。** 新方案尚未训练，不能把代码检查通过称为达到 300 分。
+公开仓库：[Catherine135/cs100709-bipedalwalker-a2c](https://github.com/Catherine135/cs100709-bipedalwalker-a2c)。源码提交物仍只有 `train.py`，模型为 `a2c.model`。**本机 Mac 不训练；本轮新算法尚无真实训练成绩。** 检查通过不代表奖励已提高或已达到 300。
 
-## 1. 依据与 Issue #3 诊断
+## 1. 最新证据：Issue #4 是中断结果，不是最终测试
 
-PDF 第 1 页允许引用开源算法，不指定某个必须复现的仓库，也不要求完全原创；第 1–3 页要求 Hardcore 机器人前进、越障、提高平均奖励并展示结果；第 4–6 页规定教师接口和提交格式；第 31–40 页给出 A2C 示例。保留默认 A2C 对照，主方案为有来源说明的 PPO 扩展。PDF 的“300+”是奖励描述，不是明确的统一及格线。
+课程 PDF 第 1 页允许引用开源算法，第 1–3 页要求 Hardcore 机器人前进、越障、提高平均奖励并展示结果，第 4–6 页规定教师接口与提交格式，第 31–40 页给出 A2C 教学示例。本项目保留 A2C，对后续 PPO/CAPG 扩展注明来源。“300+”是手册中的奖励描述，不能自行解释成统一及格线。
 
-本轮起点是 [Issue #3](https://github.com/Catherine135/cs100709-bipedalwalker-a2c/issues/3)与 [Release `campaign-20261107-results`](https://github.com/Catherine135/cs100709-bipedalwalker-a2c/releases/tag/campaign-20261107-results)，已核对完整诊断与模型：
+已读取 [Issue #4](https://github.com/Catherine135/cs100709-bipedalwalker-a2c/issues/4)及 [Release `campaign-v4-interrupted-20261108`](https://github.com/Catherine135/cs100709-bipedalwalker-a2c/releases/tag/campaign-v4-interrupted-20261108) 的模型、完整检查点与全部 13 个阶段诊断：
 
-| 上一轮实测 | 结果 |
+| 同一轮、同一平台的证据 | 结果 |
 | --- | --- |
-| 总训练步数 | 49,807,360；因旧平台期规则停止，未用完一亿预算 |
-| 选中模型 | `continue-002`，gamma=0.999 |
-| 开发筛选集 | 均分 184.85，0/20 到终点 |
-| 最终确认集 | 均分 131.53，0/20 到终点 |
-| 教师示例 1,3,5,7,9 | 均分 135.76，0/5 到终点 |
-| 被旧筛选丢弃的候选 | `continue-004`：172.89、1/20 到终点；`continue-005`：179.43、1/20 到终点 |
+| 训练状态 | 84,377,600 步时安全中断；最终确认集尚未评测 |
+| Release 模型 | `continue-007-gaussian-coverage` 阶段的**奖励候选**，gamma=0.999 |
+| 该模型验证集 | 203.47，1/20 到终点 |
+| 该模型开发筛选集 | 203.81，3/40 到终点；32 个超时，5 个摔倒 |
+| 同一开发集上的旧基线 | 129.46，1/40 到终点 |
+| 该阶段另一通关候选 | 验证 189.02、2/20；开发 204.66、4/40；未作为本次 Release 的模型上传 |
+| 发布模型的动作诊断 | 约 27.1% 的确定性动作分量超出边界后被裁剪 |
+| 已完成地形的回报 | 263.8–271.7；耗时 1521–1589 步，力矩成本约 90.3–96.0 |
 
-不少未通关回合持续前进，但 1600 步仍未走完。例如 seed 3 前进比例约 95.3%，回报 247.37，力矩成本约 98.21；seed 7 是 440 步摔倒，其记录停滞比例为 0，不能归为长时间原地停滞。旧继续阶段反复从 `continue-002` 出发，没有延续出现通关能力的分支。上述是诊断事实；不能据此断言某一个学习率参数已被因果实验验证。
+因此主要问题是**走得不够快且成本高**，并非只要不摔倒就接近 300。上一轮等到 80% 通关后才进入效率阶段，实际一直未触发。gSDE 没有在本轮显示出稳定优势，继续固定分配一半后续预算缺乏依据。日志里的价值解释方差通常较高，KL 约 0.002–0.003，也不足以断言唯一问题是价值网络坏掉或 KL 早停。
 
-原奖励本身已扣除 `0.028 × Σ|裁剪后关节动作|` 的每步力矩成本。在典型起点到终点的前进项约 364 分时，300 分留给力矩和姿态项的余量约 64 分。因此需要同时提高行进效率、降低无效动作并减少摔倒，单纯延长训练不保证改善。这个计算只是诊断，不改变奖励。
+以上是观察，不是严格的因果消融。尤其不能把 Issue #3 的 **184.85（另一开发集）** 和 Issue #4 的 **203.47（验证集）** 当作相同测试集的提升。阶段名称含 `coverage` 也不意味着其 `a2c.model` 就是通关候选。
 
-程序只自动下载两个固定 Release 文件并验证 SHA-256：
+原奖励已包含每步 `0.028 × Σ|裁剪后动作|` 的力矩成本。典型起点到终点前进项约 364 分，达到 300 需要大幅压缩累计动作/姿态成本，并保持通关。不能只减少力矩后原地不动；必须同时看原始回报、前进、长度与失败原因。
+
+程序只下载下面两个文件，不重新下载 PyTorch，下载后核对 SHA-256，并核对导出模型与完整检查点的网络参数一致：
 
 ```text
-a2c.model
-bc2d1ebca4624635d5395f4d9f80c22927564e64ece1ab544eef644cb9b474e1
+final-best-a2c.model
+8fd9ed360a38a95f287959daf859a0d683697b0b6d0dd127f0341874213a95c5
 final-best-checkpoint.pt
-b8317a49372b867f956001a785661a33372eb4875dd617d60b41f7c5750bf731
+20fbb89e90df4b0d4b92c52fb090f017c45b3a11ac1e26cc6b5e6fbd7c1cb5e5
 ```
 
-已有这两个文件可分别传 `--campaign-baseline C:\actual\a2c.model` 和 `--campaign-checkpoint C:\actual\final-best-checkpoint.pt`；哈希必须一致。不下载整个旧诊断包，不重装 PyTorch。普通 PPO 从完整检查点保留优化器；gSDE 导入相同 Actor/Critic/归一化统计量，但为新的噪声参数重建优化器。
+可以用 `--campaign-baseline C:\actual\final-best-a2c.model` 和 `--campaign-checkpoint C:\actual\final-best-checkpoint.pt` 指向本地已有的同一文件；哈希必须相符。两个实验分支都保留该检查点的网络与 Adam 状态。新阶段重置阶段交互计数，不把历史训练步数算作本轮新增步数。
 
-## 2. 新训练协议：地形覆盖后再提高效率
+## 2. 新协议与算法依据
 
-所有训练和评测仍是 `gym.make('BipedalWalker-v3', hardcore=True)`，Gymnasium 0.29.1、**1600 步**、24 维原始观测、4 维动作和原始奖励。没有奖励归一化、裁剪、额外力矩惩罚或普通模式预训练。训练内部使用旧模型的观测归一化统计量并冻结；归一化随导出模型保存。
+训练和评测仍使用 `gym.make('BipedalWalker-v3', hardcore=True)`、Gymnasium 0.29.1、**1600 步时限**、原始 24 维观测和奖励。没有奖励塑形、奖励裁剪/归一化、额外力矩惩罚、普通地形预训练或放宽时限。内部观测归一化沿用基线统计量并冻结；教师导出对象包含相同统计量。
 
-| 设置 | A：普通高斯 PPO | B：gSDE PPO |
+新方法是**裁剪动作策略梯度（Clipped Action Policy Gradient, CAPG）**。来源为 [Fujita 与 Maeda，ICML 2018](https://proceedings.mlr.press/v80/fujita18a.html)及[作者的 PPO/TRPO 实现](https://github.com/pfnet-research/capg)。它利用动作会被裁剪这一事实，减少策略梯度估计的方差。原来使用原始高斯采样值的做法仍是有效对照；这次不是把它称为错误。
+
+对每个动作维度，实际执行 `a=clip(u,-1,1)`。新分支对内部动作使用高斯密度，对 `-1` 使用左侧累积概率，对 `+1` 使用右侧尾概率，四个维度的对数概率相加：
+
+```text
+log p(a | s) = log Phi((-1-mu)/sigma)      if a = -1
+              log Normal(a; mu, sigma)   if -1 < a < 1
+              log Phi((mu-1)/sigma)      if a = +1
+```
+
+采集时保存的旧概率和 PPO 更新时的新概率都使用这个分布；只改其中一边会破坏概率比。实现使用 PyTorch 的稳定 `log_ndtr`，不是先算极小 CDF 再取 log。CAPG 分支把裁剪后的动作放入 rollout；普通 PPO 仍按 SB3 的原始采样动作计算概率。两者初始的**实际执行动作分布和确定性动作相同**，CAPG 不直接把关节控制量调小，也不改变奖励。
+
+| 设置 | A：普通高斯 PPO | B：CAPG PPO |
 | --- | --- | --- |
-| 起点 | Issue #3 最佳完整检查点 | 同一策略和价值权重；新建 Adam |
-| gamma / GAE lambda | 0.999 / 0.95 | 相同 |
-| 探索 | 每步独立高斯噪声 | 状态依赖噪声矩阵每 4 步重采样 |
-| 网络 | Actor/Critic 各两层 256、Tanh | 相同；噪声参数为 256×4 |
-| CPU / 环境 / 线程 | CPU / 16 / 1 | 相同 |
-| rollout / minibatch / epochs | 2048/环境 / 256 / 最多 10 | 相同 |
-| 学习率 / clip / target KL | 2.5e-5→2e-5 / 0.1 / 0.02 | 相同 |
-| 梯度上限 / 熵系数 | 0.5 / 0.001→0.0002 | 相同 |
-| 首次训练 / 独立复核种子 | 9873 / 10873 | 相同 |
+| 初始网络/优化器 | 同一 Issue #4 完整检查点 | 相同 |
+| 更新概率 | 原始高斯采样概率 | 实际执行动作的密度/边界概率 |
+| gamma / GAE lambda | 0.999 / **0.98** | 相同 |
+| 熵奖励系数 | **0** | **0** |
+| 网络 | Actor/Critic 各两层 256、Tanh | 相同 |
+| CPU / 并行环境 / 线程 | CPU / 16 / 1 | 相同 |
+| 每环境 rollout / minibatch | 2048 / 256 | 相同 |
+| 学习率 | 2e-5 线性降至 1e-5 | 相同 |
+| PPO clip / 最大 epoch / target KL / 梯度上限 | 0.1 / 10 / 0.02 / 0.5 | 相同 |
+| 试训 / 独立复核种子 | 19873 / 20873 | 相同 |
 
-gSDE 的初始噪声按固定归一化探针校准，初始确定性动作与原模型一致。只在训练采样时维持相关噪声，教师 `eval=True` 仍是无状态确定性动作。`eval=False` 的 portable Agent 提供边际高斯采样；正式 gSDE 训练采样由 SB3 完成。
+CAPG 诊断使用裁剪后混合分布的熵，不应与原始高斯熵直接比较。两组从开始就不再额外奖励高熵，不等于取消随机探索：基线的可学习高斯标准差仍保留。GAE lambda 从 0.95 提高到 0.98，使 `1/(1-gamma*lambda)` 所表示的优势权重衰减尺度从约 20 步增加至约 48 步；这是改善跨步态信用分配的假设，也可能增加方差。它与熵系数的调整是两组共有设置，因此本轮只直接比较同一新设置下的普通概率与 CAPG 概率；不能单独归因于 λ 或熵。
 
-**训练地形的有限重试：**每个 worker 每回合以 75% 概率生成新随机地形、25% 概率重试自身失败队列（空队列时全部生成新地形）。种子范围 `[1,000,000, 2^31)`，与全部评测种子隔离。最多保留 128 个失败种子，每个最多重试 3 次，成功则移除。每次都从原始起点开始；不缩短地形、不改变观测、奖励或时限。重试的是地形，仍重新采集当前策略轨迹，不是重复使用旧 PPO 样本。
+训练地形沿用有限失败重试：每回合 75% 概率生成新随机地形、25% 重试失败队列（空队列则全部新地形）。训练种子在 `[1,000,000, 2^31)`，最多保存 128 个失败种子，每次入队最多重试 3 次，成功即移除。每次从原始起点重新采集当前策略轨迹；不是复用旧 PPO 样本。诊断额外报告超时率、摔倒率、动作饱和比例和已通关回合平均奖励。
 
-自动流程如下：
+自动执行顺序：
 
-1. 在新验证集和开发筛选集分别复测 Release 模型，建立本机基线。
-2. A、B 各训练约 1000 万步，再以另一训练随机种子各做约 1000 万步。每约 25 万步在 20 个验证种子上评测。单阶段按分配预算完成，避免只通过验证集就反复零步停止；阶段间才根据两组开发评测决定是否提前结束整个任务。
-3. 每阶段同时保存原始均分最佳候选，以及均分距该奖励候选不超过 25 分的通关率候选（已同时达到奖励与通关目标的候选不受此限制），两者都有对应的完整优化器检查点。阶段结束后，两者分别在 40 个开发种子上评测。
-4. 保留平均奖励与通关率之间不被其他模型同时超越的候选（Pareto frontier）。继续训练按 `A 奖励 → B 奖励 → A 通关 → B 通关` 轮换，每段约 500 万步；不再仅因均分平台期在约 5000 万步停掉全部路线。候选的合并开发均分最多比 Release 基线低 25 分，避免靠严重牺牲奖励提高通关比例；无合格父模型则从相应 Release 初始化重新开始。
-5. 当某个父模型在验证集与开发集**各自**达到至少 80% 通关率，后续该分支进入效率阶段：学习率向 1e-5 降低，熵系数向 0 降低，通过原始奖励已有的力矩成本优化效率。延续阶段不提高父检查点当时的学习率或熵系数。
-6. 最终选择的合并开发均分必须不低于 Release 基线。未达到足够通关率前优先通关率；已有两组开发集均达到 80% 的候选时，在这些候选中优先原始均分。两组开发集都满足均分 300 与通关 80%，或总预算耗尽后，锁定模型再打开最终确认集。基线自身也保留为候选。
-7. 最终测试无论成败都如实保存结果、打包并退出；不能根据最终测试重新选模型、继续训练或改参数。`goal_reached=false` 的正常完成仍返回退出码 0，安全中断返回 130，运行错误才是失败。
+1. 在本轮新验证集、新开发集分别复测 Release 基线。
+2. 两种方法各试训约 500 万步，再用独立训练种子各复核约 500 万步，共四个初始阶段。每约 25 万步验证一次；每阶段保留奖励/通关两种完整候选，再在 40 个开发种子上筛选。
+3. 根据每个方法两个训练种子的结果分配后续预算。先比较达到“基线合并均分减 25 分”底线的训练种子数量，再比较两个种子的平均开发均分和通关率。若没有方法的两次训练都满足该回报底线，停止继续分配；保留实际最佳模型并完成独立评测。这个规则是工程筛选，不是统计显著性结论。
+4. 后续仅继续胜出方法，奖励候选与通关候选交替作为父模型，每段约 500 万步。完整检查点保留相应优化器；学习率不会因进入新阶段提高。失败方法的初始结果仍保留，明确写入 `allocation_decision`，不再固定给弱分支一半预算。
+5. 相对上次有意义进展的记录，开发均分提高至少 5 分，或通关率提高至少 5 个百分点，才重置平台期计数。**连续 3 段无此改善就停止**，不反复从同一旧模型无限续训。所有继续候选仍受回报底线约束。
+6. 最终模型的合并开发均分不得低于 Release 基线。先改善通关比例；已有验证集与开发集各自达到 80% 的候选时，在这些候选中优先原始均分。两组都达到均分 300 与通关 80%、预算耗尽或触发停止规则时，先锁定模型，再打开 100 个最终确认种子。最终测试失败不会触发重新筛选。
 
-合并开发指标按 20 个验证回合＋40 个筛选回合加权，两个集合都参与开发，不能称为最终测试。80% 是本轮“大部分种子到达终点”的工程目标，不是声称 PDF 规定这个门槛；程序也单独报告严格的全部通关且均分 300。
+奖励候选按验证原始均分保存；通关候选通常要求距当前奖励候选不超过 25 分，已满足两项目标者不受该差值限制。比较阶段时保留奖励/通关的非支配候选，20 个验证回合和 40 个开发回合按回合数加权。最终的 80% 与 300 目标分别检查各个集合，不能以合并平均掩盖某一集合失败。
 
-总预算默认 **100,000,000 次新训练交互**，包含全部试训、复核和继续阶段，不是每组各一亿；向下取整后硬上限 **99,975,168**。每个 1000 万阶段为 **9,994,240** 步，500 万阶段为 **4,980,736** 步，最后阶段使用剩余完整 rollout。评测另计、不更新权重。仅首次启动前可调整 `--campaign-budget`、`--pilot-steps`、`--chunk-steps`；总预算至少覆盖四个初始阶段。不能训练中悄悄增加预算。
+默认最多 **60,000,000 次新训练交互**，按 32768 步完整 rollout 取整后硬上限 **59,998,208**；每个约 500 万步阶段为 **4,980,736**。评测不更新权重，单独计数。预算是上限，可能因达标、未通过两种子回报底线筛选或平台期提前结束。只在首次启动前调整 `--campaign-budget`、`--pilot-steps`、`--chunk-steps`，不能训练途中扩大预算。
 
 ## 3. Windows agent：复用环境并开始任务
 
@@ -134,12 +150,12 @@ Invoke-RlPython -B train.py --mode campaign --dry-run
 **正式启动，只执行这一条训练入口：**
 
 ```powershell
-$RlTaskDir = Join-Path $RlRepo 'runs\campaign-issue3-v4'
+$RlTaskDir = Join-Path $RlRepo 'runs\campaign-issue4-v5'
 New-Item -ItemType Directory -Force $RlTaskDir | Out-Null
 Invoke-RlPython -u train.py --mode campaign --campaign-dir $RlTaskDir 2>&1 | Tee-Object -FilePath "$RlTaskDir\campaign-console.log" -Append
 ```
 
-这是新的 v2 协议，必须使用新的 `campaign-issue3-v4` 目录，保留上一轮目录。无需手动分别启动 A/B 或修改 gamma。使用 agent 可持续终端会话，不让工具短超时终止任务；记录 PID、创建时间、会话 ID、源码提交到交接记录。每 30–60 秒查看新增日志和进程，持续跟进至交付物完成，不能以“已经启动”结束任务。程序会在 Windows 任务运行期间申请系统保持唤醒并在退出时释放，不修改永久电源设置。
+这是新的 v3 协议，必须使用新的 `campaign-issue4-v5` 目录。保留旧的 `runs/campaign-issue3-v4` 和 commit `13fb52b`；旧任务若要恢复，只能用其旧源码。新任务无需手动启动 A/B 或修改参数。使用 agent 可持续终端会话，不让工具短超时终止任务；记录 PID、创建时间、会话 ID、源码提交到交接记录。每 30–60 秒查看新增日志和进程，持续跟进至交付物完成，不能以“已经启动”结束任务。程序会在 Windows 任务运行期间申请系统保持唤醒并在退出时释放，不修改永久电源设置。
 
 ## 4. 暂停、恢复和预算记录
 
@@ -158,12 +174,12 @@ Invoke-RlPython -u train.py --mode campaign --campaign-dir $RlTaskDir 2>&1 | Tee
 | 用途 | 默认种子 | 何时使用 |
 | --- | --- | --- |
 | 训练地形 | `[1,000,000, 2^31)` 中随机抽取 | 新地形与有限失败重试 |
-| 阶段验证 | 11001,11003,…,11039（20 个） | 阶段内选择两种候选 |
-| 开发筛选 | 12001,12003,…,12079（40 个） | 阶段比较，明确参与开发 |
-| 最终确认 | 13001,13003,…,13199（100 个） | `final-choice.json` 锁定后首次评测 |
+| 阶段验证 | 21001,21003,…,21039（20 个） | 阶段内选择两种候选 |
+| 开发筛选 | 22001,22003,…,22079（40 个） | 阶段比较，明确参与开发 |
+| 最终确认 | 23001,23003,…,23199（100 个） | `final-choice.json` 锁定后首次评测 |
 | 教师示例 | 1,3,5,7,9 | 锁定后展示；已在历史开发中看过，不能称为新留出集 |
 
-上一轮的确认种子已经用于诊断，本轮换一组。最终验收文件分开报告：
+Issue #4 在最终确认前中断；不要擅自打开其旧确认集来调参。本轮预先固定新的种子组。最终验收文件分开报告：
 
 - `coverage_goal_reached`：验证、开发筛选、最终确认集**各自**至少 80% 到达真正终点。
 - `reward_goal_reached`：这三个集合各自原始平均奖励至少 300。
@@ -176,8 +192,8 @@ Invoke-RlPython -u train.py --mode campaign --campaign-dir $RlTaskDir 2>&1 | Tee
 
 | 路径（相对于任务目录） | 内容 |
 | --- | --- |
-| `campaign.json` | 固定协议、状态、阶段选择、预算上限、环境版本 |
-| `stages/*/config.json` | 实际 gamma、探索分布、学习率/熵调度、地形重试与归一化设置 |
+| `campaign.json` | 固定协议、状态、两训练种子的 allocation_decision、阶段选择和预算上限 |
+| `stages/*/config.json` | 实际 gamma、GAE lambda、CAPG 开关、学习率/熵调度及环境设置 |
 | `stages/*/console.log`、TensorBoard、`episodes.jsonl` | 真实训练过程与原始回合奖励 |
 | `stages/*/progress.json` | 完整更新步数、真实 Adam 更新次数、epoch 计数、PID |
 | `stages/*/evaluations.jsonl`、`selection-return.json`、`selection-coverage.json` | 验证和开发筛选的逐种子结果 |
@@ -212,19 +228,18 @@ Invoke-RlPython -B train.py --mode eval --device cpu --model-path "$RlTaskDir\a2
 Invoke-RlPython -B train.py --mode eval --device cpu --model-path "$RlTaskDir\a2c.model" --eval-seeds 1 3 5 7 9 --render
 ```
 
-## 7. 公开代码的参考范围与限制
+## 7. 本轮检索的公开资料及取舍
 
-| 原始来源 | 本轮采用或保留的思路 | 适用范围 |
+| 原始来源 | 查到的依据 | 本轮取舍 |
 | --- | --- | --- |
-| [gSDE 论文：Smooth Exploration for Robotic Reinforcement Learning](https://arxiv.org/abs/2005.05719)；[SB3 2.4.1 分布实现](https://github.com/DLR-RM/stable-baselines3/blob/v2.4.1/stable_baselines3/common/distributions.py) | 用已有 gSDE 实现替代其中一组的逐步独立高斯噪声，每 4 步重采样探索矩阵 | 论文支持探索平滑性的动机，没有证明本项目 1600 步 Hardcore 能达 300。本轮不增加依赖 |
-| [LLNL PPO-and-Friends 结果](https://github.com/llnl/ppo_and_friends/blob/6e5dcbacb741d91c82ba72d440d8cbb9017f6301/baselines/README.md)及[训练源码](https://github.com/llnl/ppo_and_friends/blob/6e5dcbacb741d91c82ba72d440d8cbb9017f6301/baselines/gymnasium/bipedal_walker_hardcore.py) | 参考阶段训练与后期降低学习率；作者报告 Hardcore 100 回合均分约 313 | 原实现使用奖励裁剪/归一化和 2000 步注册环境，本项目不照搬这些改变，也不宣称复现其成绩 |
-| [RL Zoo PPO 配置](https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/hyperparams/ppo.yml) | 一亿步量级的预算与调度作为工程参考 | 增加预算只能增加学习机会，不能保证成功 |
-| [dgriff777 A3C](https://github.com/dgriff777/a3c_continuous/tree/ef12d863a982019ace0608f2798947567230d715) | 查阅 LSTM 连续控制实现，保留为后续备选 | 教师接口没有回合重置通知；直接持有记忆会有跨回合串状态风险。原项目也修改训练奖励，本轮未加入 LSTM |
-| [SB3-Contrib TQC](https://sb3-contrib.readthedocs.io/en/v2.4.0/modules/tqc.html)及[RL Zoo 配置](https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/hyperparams/tqc.yml) | 查阅样本复用与 gSDE 的实现线索 | 官方列出的 Hardcore 200 万步、3 个训练种子结果为 228±18，未证明本课程时限下达到 300；本轮不加入新的离策略学习器和大型经验回放文件 |
+| [CAPG 论文](https://proceedings.mlr.press/v80/fujita18a.html)及[作者实现](https://github.com/pfnet-research/capg) | 对裁剪动作的策略梯度给出无偏、较低方差分析；公开代码包含 PPO/TRPO | 针对约 27% 动作饱和实现 PyTorch/SB3 适配。没有把论文结论当作本项目 300 分保证，也没有照搬旧 Chainer 依赖 |
+| [GAE 原论文](https://arxiv.org/abs/1506.02438) | λ 调节优势估计的偏差/方差与时间范围 | 在两组共同测试 λ=0.98；保留单次训练参数可做后续有预算的消融 |
+| [SB3 2.4.1 PPO](https://github.com/DLR-RM/stable-baselines3/blob/v2.4.1/stable_baselines3/ppo/ppo.py) | PPO 裁剪目标、GAE、终止处理和恢复机制 | 沿用已有实现，仅适配概率分布和调度；不重装库 |
+| [FORK 作者 Hardcore 实现](https://github.com/honghaow/FORK/tree/master/BipedalWalkerHardcore) | 查阅了完整 notebook；训练把 -100 改成 -5，其他奖励乘 5，并使用 Hardcore 专用注册环境 | 不把它的高分当作本任务可直接复现的成绩，本轮不采用这些奖励变更 |
+| [SB3-Contrib TQC](https://sb3-contrib.readthedocs.io/en/v2.4.0/modules/tqc.html)及[RL Zoo 配置](https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/hyperparams/tqc.yml) | 官方 Hardcore 200 万步、3 种子结果为 228±18；使用另一注册时限 | 有样本效率研究价值，但没有证明当前 1600 步任务可达 300；本轮优先复用已学会行走的模型 |
+| [LLNL PPO-and-Friends 源码](https://github.com/llnl/ppo_and_friends/blob/6e5dcbacb741d91c82ba72d440d8cbb9017f6301/baselines/gymnasium/bipedal_walker_hardcore.py) | 分阶段学习率与训练奖励裁剪 | 保留有依据的阶段调度，不复制奖励变更 |
 
-失败地形的有限重试、双候选保存、预算分配是针对 Issue #3 设计的工程策略，并非声称复制上述论文的完整算法。比较两条路线也不是严格的单变量消融：普通 PPO 延续原 Adam，gSDE 的噪声参数形状变化需要重建 Adam，应同时报告这个差异。
-
-实际更新算法为 [SB3 2.4.1 PPO](https://github.com/DLR-RM/stable-baselines3/blob/v2.4.1/stable_baselines3/ppo/ppo.py)，引用 [PPO](https://arxiv.org/abs/1707.06347) 与 [GAE](https://arxiv.org/abs/1506.02438)。原始奖励和时限见 [Gymnasium 0.29.1 环境](https://github.com/Farama-Foundation/Gymnasium/blob/v0.29.1/gymnasium/envs/box2d/bipedal_walker.py)与[注册源码](https://github.com/Farama-Foundation/Gymnasium/blob/v0.29.1/gymnasium/envs/__init__.py)。
+原始奖励及 1600 步限制以 [Gymnasium 0.29.1 环境源码](https://github.com/Farama-Foundation/Gymnasium/blob/v0.29.1/gymnasium/envs/box2d/bipedal_walker.py)和[注册定义](https://github.com/Farama-Foundation/Gymnasium/blob/v0.29.1/gymnasium/envs/__init__.py)为准。gSDE 及旧模型载入支持仍保留，但本轮自动 campaign 不再运行 gSDE。LSTM 仍未引入，因为现有教师接口没有回合重置通知。
 
 ## 8. 保留的单次训练与 A2C 对照
 

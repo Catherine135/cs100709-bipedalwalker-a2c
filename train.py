@@ -19,14 +19,15 @@ Primary source
     PPO requires: python -m pip install stable-baselines3==2.4.1
     Reuse existing dependencies; do not reinstall PyTorch. The exported Agent
     stores normalization statistics and CPU weights and needs no SB3 for inference.
-    Issue #3 starts from the user's pinned best checkpoint, compares standard PPO
-    with SB3 gSDE, revisits a bounded queue of failed training terrains, and keeps
-    separate complete return/finish-rate leaders. Observation statistics stay
-    frozen. After development coverage reaches 80%, continuation anneals learning
-    rate and entropy for original-reward efficiency. A 100-seed final holdout is
-    used only after selection. These changes are hypotheses, not measured gains.
-    References: https://arxiv.org/abs/2005.05719 and the pinned public sources in
-    README.md. Training never modifies the original reward or 1600-step limit.
+    Issue #4 starts from the interrupted run's pinned best complete checkpoint.
+    Compare ordinary Gaussian PPO with clipped action policy gradient (CAPG),
+    using executed-action probabilities at saturation bounds. Both use GAE .98,
+    no entropy bonus, frozen observation statistics and bounded terrain replay.
+    Two training seeds per method precede budget allocation to the better method;
+    three unproductive continuation chunks stop the experiment. These changes
+    are hypotheses, not measured gains. The final holdout remains isolated.
+    CAPG: https://proceedings.mlr.press/v80/fujita18a.html
+    Original rewards and the 1600-step task are preserved; see README.md.
 
 Windows setup (run in a Miniconda Prompt)
     conda create -n cs100709 -c conda-forge python=3.11 box2d-py=2.3.8 pip -y
@@ -50,7 +51,7 @@ Commands (keep this file named train.py)
     python train.py --mode train --return-steps 8 --max-grad-norm 0.5 --log-dir runs/nstep --model-path runs/nstep/a2c.model
     python train.py --mode check --algorithm ppo
     python train.py --mode campaign --dry-run
-    python train.py --mode campaign --campaign-dir runs/campaign-issue3-v4
+    python train.py --mode campaign --campaign-dir runs/campaign-issue4-v5
     python train.py --mode train --algorithm ppo --steps 20000000 --log-dir runs/ppo --model-path runs/ppo/a2c.model
     tensorboard --logdir runs
 
@@ -58,8 +59,8 @@ Modes and outputs
     Train and campaign update weights on Windows. Check, eval, dry-run and
     benchmark never update weights. The CLI rejects training on the user's Mac.
     Campaign defaults: CPU, 16 environments, 1 thread, minibatches of 256;
-    two 10M-step pilots, two independent-seed replications, and 5M continuations
-    within a total 100M new-interaction budget. Stage budgets round down to complete rollouts. Reissue
+    two 5M-step pilots, two independent-seed replications, and 5M continuations
+    within a total 60M new-interaction budget. Stage budgets round down to complete rollouts. Reissue
     the identical campaign command to resume; no PyTorch reinstall is required.
     Benchmark times environment sampling plus forward/backward computation; it
     excludes optimizer steps, logging, evaluation and saving, so it is a throughput
@@ -129,13 +130,13 @@ EPISODE_LIMIT = 1600
 FORMAT_VERSION = 1
 VALIDATION_SEEDS = [101, 103, 105, 107, 109]
 EXAMPLE_SEEDS = [1, 3, 5, 7, 9]
-CAMPAIGN_VALIDATION_SEEDS = list(range(11001, 11041, 2))
-CAMPAIGN_SELECTION_SEEDS = list(range(12001, 12081, 2))
-CAMPAIGN_CONFIRMATION_SEEDS = list(range(13001, 13201, 2))
+CAMPAIGN_VALIDATION_SEEDS = list(range(21001, 21041, 2))
+CAMPAIGN_SELECTION_SEEDS = list(range(22001, 22081, 2))
+CAMPAIGN_CONFIRMATION_SEEDS = list(range(23001, 23201, 2))
 TRAIN_SEED_MIN = 1_000_000
-BASELINE_URL = "https://github.com/Catherine135/cs100709-bipedalwalker-a2c/releases/download/campaign-20261107-results/a2c.model"
-BASELINE_SHA256 = "bc2d1ebca4624635d5395f4d9f80c22927564e64ece1ab544eef644cb9b474e1"
-BASELINE_CHECKPOINT_SHA256 = "b8317a49372b867f956001a785661a33372eb4875dd617d60b41f7c5750bf731"
+BASELINE_URL = "https://github.com/Catherine135/cs100709-bipedalwalker-a2c/releases/download/campaign-v4-interrupted-20261108/final-best-a2c.model"
+BASELINE_SHA256 = "8fd9ed360a38a95f287959daf859a0d683697b0b6d0dd127f0341874213a95c5"
+BASELINE_CHECKPOINT_SHA256 = "20fbb89e90df4b0d4b92c52fb090f017c45b3a11ac1e26cc6b5e6fbd7c1cb5e5"
 __all__ = ["Actor", "Agent", "Critic", "Mish"]
 
 
@@ -1234,6 +1235,50 @@ def ppo_dependencies():
     return sb3.PPO, BaseCallback, Monitor, DummyVecEnv, SubprocVecEnv, VecNormalize
 
 
+# Compute the probability of executed actions, including atoms at the two clipping bounds.
+def clipped_normal_log_prob(means, stds, actions):
+    lower = torch.special.log_ndtr((-1.0 - means) / stds)
+    upper = torch.special.log_ndtr((means - 1.0) / stds)
+    interior = torch.distributions.Normal(means, stds).log_prob(actions.clamp(-1., 1.))
+    return torch.where(actions <= -1., lower, torch.where(actions >= 1., upper, interior)).sum(dim=-1)
+
+
+# Report mixed discrete/continuous entropy in the fixed action coordinates [-1, 1].
+def clipped_normal_entropy(means, stds):
+    a, b = (-1. - means) / stds, (1. - means) / stds
+    log_left, log_right = torch.special.log_ndtr(a), torch.special.log_ndtr(-b)
+    inside = (torch.special.ndtr(b) - torch.special.ndtr(a)).clamp(0., 1.)
+    boundary = -(log_left.exp() * log_left + log_right.exp() * log_right)
+    phi_a, phi_b = torch.exp(-.5 * a.square()) / math.sqrt(2 * math.pi), torch.exp(-.5 * b.square()) / math.sqrt(2 * math.pi)
+    continuous = inside * (stds.log() + .5 * math.log(2 * math.pi) + .5) + .5 * (a * phi_a - b * phi_b)
+    return (boundary + continuous).sum(dim=-1)
+
+
+# Adapt SB3's distribution protocol lazily; portable teacher models still need no SB3.
+def configure_ppo_distribution(model, capg=False):
+    from stable_baselines3.common.distributions import DiagGaussianDistribution
+    if model.use_sde:
+        if capg:
+            raise ValueError("CAPG requires independent diagonal Gaussian actions, not gSDE.")
+        return
+
+    class ClippedGaussian(DiagGaussianDistribution):
+        def sample(self):
+            return super().sample().clamp(-1., 1.)
+
+        def mode(self):
+            return super().mode().clamp(-1., 1.)
+
+        def log_prob(self, actions):
+            return clipped_normal_log_prob(self.distribution.mean, self.distribution.stddev, actions)
+
+        def entropy(self):
+            return clipped_normal_entropy(self.distribution.mean, self.distribution.stddev)
+
+    # SB3 saves network/optimizer state, not this object; explicitly reconstruct it after every load.
+    model.policy.action_dist = ClippedGaussian(ACTION_DIM) if capg else DiagGaussianDistribution(ACTION_DIM)
+
+
 # Revisit a bounded sample of failed training terrains without changing observations or rewards.
 class TerrainReplay(gym.Wrapper):
     def __init__(self, env, replay_fraction=0.25):
@@ -1474,7 +1519,9 @@ def _run_ppo_training(args):
         if args.steps < resume["steps"] or args.num_envs != resume["config"]["num_envs"]:
             raise ValueError("Resume needs a sufficient cumulative budget and the original number of environments.")
         for key in ("seed", "validation_seeds", "confirmation_seeds", "defer_confirmation", "ppo_use_sde",
-                    "sde_sample_freq", "terrain_replay_fraction", "freeze_obs_stats", "entropy_start", "entropy_end", "target_success"):
+                    "sde_sample_freq", "terrain_replay_fraction", "freeze_obs_stats", "entropy_start", "entropy_end", "target_success",
+                    "ppo_capg", "ppo_gae_lambda", "ppo_learning_rate", "ppo_final_lr", "ppo_clip_range", "ppo_final_clip",
+                    "ppo_target_kl", "ppo_epochs", "ppo_eval_steps", "target_reward"):
             if key in resume["config"]:
                 setattr(args, key, resume["config"][key])
         if set(args.eval_seeds) & (set(args.validation_seeds) | set(args.confirmation_seeds)):
@@ -1498,6 +1545,9 @@ def _run_ppo_training(args):
             model = PPO.load(io.BytesIO(source["model_zip"].numpy().tobytes()), env=env, device=args.device)
             model.tensorboard_log = str(run_dir)
             if resume:
+                args.ppo_capg = resume["config"].get("ppo_capg", False)
+                args.ppo_gae_lambda = model.gae_lambda
+                args.gamma, args.ppo_rollout_steps, args.ppo_batch_size = model.gamma, model.n_steps, model.batch_size
                 restore_rng(resume["rng"])
                 if args.terrain_replay_fraction:
                     states = resume.get("runtime", {}).get("terrain_states")
@@ -1523,11 +1573,13 @@ def _run_ppo_training(args):
                 model.target_kl = args.ppo_target_kl
                 model.n_epochs = args.ppo_epochs
                 model.sde_sample_freq = args.sde_sample_freq
+                model.gae_lambda = args.ppo_gae_lambda
+                model.rollout_buffer.gae_lambda = args.ppo_gae_lambda
         else:
             model = PPO("MlpPolicy", env, device=args.device, seed=args.seed,
                         n_steps=args.ppo_rollout_steps, batch_size=args.ppo_batch_size,
                         learning_rate=linear_schedule(args.ppo_learning_rate, args.ppo_final_lr),
-                        n_epochs=args.ppo_epochs, gamma=args.gamma, gae_lambda=0.95,
+                        n_epochs=args.ppo_epochs, gamma=args.gamma, gae_lambda=args.ppo_gae_lambda,
                         clip_range=linear_schedule(args.ppo_clip_range, args.ppo_final_clip),
                         ent_coef=args.entropy_start, vf_coef=0.5, max_grad_norm=0.5,
                         use_sde=args.ppo_use_sde, sde_sample_freq=args.sde_sample_freq,
@@ -1536,6 +1588,7 @@ def _run_ppo_training(args):
                         tensorboard_log=str(run_dir), verbose=1)
             if args.warm_start:
                 warm_start_ppo(model, env, torch.load(args.warm_start, map_location="cpu", weights_only=True), args.reset_critic)
+        configure_ppo_distribution(model, args.ppo_capg)
         warmup_until = args.critic_warmup_rollouts * model.n_steps * args.num_envs
         if resume:
             warmup_until = resume.get("runtime", {}).get("warmup_until", 0)
@@ -1557,6 +1610,7 @@ def _run_ppo_training(args):
                              "learning_rate_start": model.lr_schedule(1.0), "learning_rate_end": model.lr_schedule(0.0),
                              "clip_start": model.clip_range(1.0), "clip_end": model.clip_range(0.0),
                              "target_kl": model.target_kl, "warmup_until": warmup_until,
+                             "capg": args.ppo_capg,
                              "use_sde": model.use_sde, "sde_sample_freq": model.sde_sample_freq,
                              "entropy_start": args.entropy_start, "entropy_end": args.entropy_end,
                              "freeze_obs_stats": args.freeze_obs_stats, "terrain_replay_fraction": args.terrain_replay_fraction}}
@@ -1674,7 +1728,7 @@ def file_sha256(path, normalize_newlines=False):
 
 def campaign_spec(args):
     rollout = args.num_envs * args.ppo_rollout_steps
-    return {"version": 2, "source_lf_sha256": file_sha256(__file__, True),
+    return {"version": 3, "source_lf_sha256": file_sha256(__file__, True),
             "baseline_sha256": BASELINE_SHA256, "baseline_checkpoint_sha256": BASELINE_CHECKPOINT_SHA256,
             "budget": args.campaign_budget // rollout * rollout,
             "pilot_steps": args.pilot_steps // rollout * rollout, "chunk_steps": args.chunk_steps // rollout * rollout,
@@ -1683,23 +1737,24 @@ def campaign_spec(args):
             "validation_seeds": CAMPAIGN_VALIDATION_SEEDS, "selection_seeds": CAMPAIGN_SELECTION_SEEDS,
             "confirmation_seeds": list(args.confirmation_seeds), "example_seeds": list(args.eval_seeds),
             "target": args.target_reward, "target_success": args.target_success, "gamma": 0.999,
-            "profiles": ["gaussian", "sde"], "learning_rate": [2.5e-5, 2e-5], "clip_range": [0.1, 0.1],
+            "profiles": ["gaussian", "capg"], "learning_rate": [2e-5, 1e-5], "clip_range": [0.1, 0.1], "gae_lambda": .98,
             "batch_size": 256, "terrain_replay_fraction": 0.25, "sde_sample_freq": 4,
-            "freeze_obs_stats": True, "coverage_entropy": [0.001, 0.0002], "efficiency_entropy": [0.0002, 0.0],
-            "continuation_reward_tolerance": 25.0, "final_reward_tolerance": 0.0}
+            "freeze_obs_stats": True, "coverage_entropy": [0.0, 0.0], "efficiency_entropy": [0.0, 0.0],
+            "continuation_reward_tolerance": 25.0, "final_reward_tolerance": 0.0,
+            "plateau_chunks": 3, "meaningful_reward_gain": 5.0, "meaningful_success_gain": .05}
 
 
 # Fetch only the user's pinned release artifact, verifying its digest before loading it.
 def campaign_baseline(root, supplied=None, checkpoint=False):
     name = "final-best-checkpoint.pt" if checkpoint else "a2c.model"
     digest = BASELINE_CHECKPOINT_SHA256 if checkpoint else BASELINE_SHA256
-    url = BASELINE_URL.rsplit("/", 1)[0] + "/" + name
+    url = BASELINE_URL.rsplit("/", 1)[0] + "/" + name if checkpoint else BASELINE_URL
     path = Path(root) / "baseline" / name
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         if supplied:
             if file_sha256(supplied) != digest:
-                raise ValueError("Baseline does not match the pinned Issue #3 release artifact.")
+                raise ValueError("Baseline does not match the pinned Issue #4 release artifact.")
             shutil.copy2(supplied, path)
         else:
             temporary = path.with_suffix(".download")
@@ -1729,7 +1784,12 @@ def evaluation_summary(result):
             "mean_progress": float(np.mean(progress)) if progress else 0.0,
             "median_progress": float(np.median(progress)) if progress else 0.0,
             "stall_fraction": float(np.mean(stalls)) if stalls else 0.0,
-            "mean_motor_cost": float(np.mean([-row.get("reward_terms", {}).get("motor", 0.) for row in diagnostics])) if diagnostics else 0.0}
+            "mean_motor_cost": float(np.mean([-row.get("reward_terms", {}).get("motor", 0.) for row in diagnostics])) if diagnostics else 0.0,
+            "timeout_rate": float(np.mean([row.get("end_reason") == "time_limit" for row in diagnostics])) if diagnostics else 0.0,
+            "fall_rate": float(np.mean([row.get("end_reason") in ("fall", "left_boundary") for row in diagnostics])) if diagnostics else 0.0,
+            "action_clip_fraction": float(np.mean([row.get("action_clip_fraction", 0.) for row in diagnostics])) if diagnostics else 0.0,
+            "finish_mean_reward": float(np.mean([reward for reward, row in zip(result["rewards"], diagnostics) if row["success"]]))
+                if any(row.get("success") for row in diagnostics) else None}
 
 
 def development_score(candidate):
@@ -1848,15 +1908,13 @@ class Campaign:
             allocation = allocation // spec["rollout"] * spec["rollout"]
             if allocation < spec["rollout"]:
                 return None
-            efficiency = parent is not None and all(parent[key]["success_rate"] >= spec["target_success"] for key in ("score", "validation"))
             existing = {"name": name, "gamma": gamma, "seed": seed, "allocation": allocation, "profile": profile,
-                        "steps": 0, "lost_steps_upper_bound": 0, "status": "pending", "phase": "efficiency" if efficiency else "coverage",
+                        "steps": 0, "lost_steps_upper_bound": 0, "status": "pending", "phase": "efficiency",
                         "parent_checkpoint": parent["checkpoint"] if parent else
-                            str(self.baseline_path.with_name("final-best-checkpoint.pt")) if profile == "gaussian" else None,
-                        "lr_start": 2.5e-5, "lr_end": 1e-5 if efficiency else 2e-5,
+                            str(self.baseline_path.with_name("final-best-checkpoint.pt")),
+                        "lr_start": spec["learning_rate"][0], "lr_end": spec["learning_rate"][1],
                         "clip_start": 0.1, "clip_end": 0.1,
-                        "entropy_start": spec["efficiency_entropy" if efficiency else "coverage_entropy"][0],
-                        "entropy_end": spec["efficiency_entropy" if efficiency else "coverage_entropy"][1]}
+                        "entropy_start": 0.0, "entropy_end": 0.0}
             if parent:
                 # Continuation never restarts at a larger learning rate after selecting an earlier best.
                 previous = read_ppo_checkpoint(parent["checkpoint"])
@@ -1906,14 +1964,15 @@ class Campaign:
                        "--ppo-learning-rate", str(existing["lr_start"]), "--ppo-final-lr", str(existing["lr_end"]),
                        "--ppo-clip-range", str(existing["clip_start"]), "--ppo-final-clip", str(existing["clip_end"]),
                        "--ppo-target-kl", "0.02", "--defer-confirmation", "--target-reward", str(spec["target"]),
+                       "--ppo-gae-lambda", str(spec["gae_lambda"]),
                        "--target-success", str(spec["target_success"]), "--freeze-obs-stats",
                        "--terrain-replay-fraction", str(spec["terrain_replay_fraction"]),
                        "--entropy-start", str(existing["entropy_start"]), "--entropy-end", str(existing["entropy_end"]),
                        "--sde-sample-freq", str(spec["sde_sample_freq"]),
                        "--stop-file", str(self.root / "STOP"), "--validation-seeds", *map(str, spec["validation_seeds"]),
                        "--confirmation-seeds", *map(str, spec["confirmation_seeds"]), "--eval-seeds", *map(str, spec["example_seeds"])]
-            if profile == "sde":
-                command += ["--ppo-use-sde"]
+            if profile == "capg":
+                command += ["--ppo-capg"]
             if checkpoint_path.exists():
                 command += ["--resume", str(checkpoint_path)]
             elif existing["parent_checkpoint"]:
@@ -1955,7 +2014,24 @@ class Campaign:
         return candidate
 
 
-# Explore both noise families and preserve reward/coverage routes throughout the fixed budget.
+# Compare both training seeds before assigning additional budget to one method.
+def rank_profiles(campaign, baseline):
+    summaries = {}
+    floor = development_score(baseline)["mean_reward"] - campaign.spec["continuation_reward_tolerance"]
+    for profile in campaign.spec["profiles"]:
+        seeds = []
+        for prefix in ("pilot", "replicate"):
+            stage = campaign.manifest["stages"][f"{prefix}-{profile}"]
+            candidate = max(stage["candidates"], key=candidate_key)
+            seeds.append(development_score(candidate))
+        summaries[profile] = {"acceptable_seeds": sum(row["mean_reward"] >= floor for row in seeds),
+                              "mean_reward": float(np.mean([row["mean_reward"] for row in seeds])),
+                              "success_rate": float(np.mean([row["success_rate"] for row in seeds])), "seeds": seeds}
+    winner = max(summaries, key=lambda p: (summaries[p]["acceptable_seeds"], summaries[p]["mean_reward"], summaries[p]["success_rate"]))
+    return winner, summaries
+
+
+# Stop funding a losing method after replication; continue both reward/coverage leaders of the winner.
 def campaign_search(campaign, baseline):
     spec = campaign.spec
     candidates = [baseline]
@@ -1970,25 +2046,41 @@ def campaign_search(campaign, baseline):
         campaign.save()
         return result
 
-    # Both profiles receive two independent training seeds, even if early means plateau.
     for prefix, seed in (("pilot", spec["seed"]), ("replicate", spec["replication_seed"])):
         for profile in spec["profiles"]:
             collect(f"{prefix}-{profile}", profile, seed, spec["pilot_steps"])
-    index = 0
+    profile, summaries = rank_profiles(campaign, baseline)
+    campaign.manifest["allocation_decision"] = {"profile": profile, "replicated_results": summaries}
+    campaign.save()
+    champion = choose_candidate(candidates, baseline, spec, coverage=True, final=True)
+    if summaries[profile]["acceptable_seeds"] < 2:
+        return champion, "no_replicated_admissible_profile"
+    index = plateau = 0
+    def progress_marks():
+        eligible = [c for c in candidates if development_score(c)["mean_reward"] >=
+                    development_score(baseline)["mean_reward"] - spec["continuation_reward_tolerance"]]
+        return {key: max(development_score(c)[key] for c in eligible) for key in ("mean_reward", "success_rate")}
+    marks = progress_marks()
     while True:
         champion = choose_candidate(candidates, baseline, spec, coverage=True, final=True)
         if development_passed(champion, spec):
             return champion, "development_target_reached"
+        if plateau >= spec["plateau_chunks"]:
+            return champion, "development_plateau"
         index += 1
-        profile = spec["profiles"][(index - 1) % len(spec["profiles"])]
-        coverage = ((index - 1) // len(spec["profiles"])) % 2 == 1
+        coverage = index % 2 == 0
         pool = pareto_candidates([c for c in candidates if c["profile"] == profile])
         parent = choose_candidate(pool, baseline, spec, coverage=coverage)
-        # An inadmissible branch restarts from the pinned baseline, never a degraded policy.
         name = f"continue-{index:03d}-{profile}-{'coverage' if coverage else 'return'}"
         result = collect(name, profile, spec["seed"] + 2000 + index, spec["chunk_steps"], parent=parent)
         if result is None:
             return champion, "budget_exhausted"
+        current = progress_marks()
+        improved = (current["mean_reward"] >= marks["mean_reward"] + spec["meaningful_reward_gain"] or
+                    current["success_rate"] >= marks["success_rate"] + spec["meaningful_success_gain"] - 1e-9)
+        plateau = 0 if improved else plateau + 1
+        if improved:
+            marks = current
 
 
 # Produce real curves from each stage's original rewards, with no synthesized training data.
@@ -2243,15 +2335,33 @@ def check_ppo(args):
                 assert sorted(saved) == [8, 16]
                 init_args = parse_args(["--algorithm", "ppo", "--num-envs", "1", "--steps", "8",
                     "--ppo-rollout-steps", "8", "--ppo-batch-size", "8", "--init-checkpoint", str(destination),
+                    "--ppo-capg", "--ppo-gae-lambda", ".98",
                     "--log-dir", str(Path(folder) / "continuation"), "--model-path", str(Path(folder) / "continuation.model")])
                 def continuation_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name):
                     assert current.num_timesteps == 0 and optimizer_step_count(current) == 7
                     assert math.isclose(current.lr_schedule(1.), init_args.ppo_learning_rate)
+                    assert current.gae_lambda == current.rollout_buffer.gae_lambda == .98
+                    assert type(current.policy.action_dist).__name__ == "ClippedGaussian"
                     return fake_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name)
                 with patch.object(PPO, "learn", continuation_learn), patch("train.evaluate_agent", fake_eval), \
                         contextlib.redirect_stdout(io.StringIO()):
                     continuation = run_ppo_training(init_args)
                     assert continuation["steps"] == 8 and continuation["optimizer_steps"] == 7
+                capg_checkpoint = next(Path(init_args.log_dir).rglob("checkpoint.pt"))
+                init_args.init_checkpoint = None
+                init_args.resume = str(capg_checkpoint)
+                init_args.ppo_capg, init_args.ppo_gae_lambda = False, .95  # Resume must restore the saved algorithm settings.
+                init_args.ppo_learning_rate, init_args.ppo_final_lr = .123, .0123
+                init_args.steps = 16
+                def capg_resume_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name):
+                    assert current.num_timesteps == 8 and optimizer_step_count(current) == 7
+                    assert current.gae_lambda == current.rollout_buffer.gae_lambda == .98
+                    assert type(current.policy.action_dist).__name__ == "ClippedGaussian"
+                    assert init_args.ppo_learning_rate == read_ppo_checkpoint(capg_checkpoint)["config"]["ppo_learning_rate"]
+                    return fake_learn(current, total_timesteps, reset_num_timesteps, callback, tb_log_name)
+                with patch.object(PPO, "learn", capg_resume_learn), patch("train.evaluate_agent", fake_eval), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    assert run_ppo_training(init_args)["steps"] == 16
                 warm_path = Path(folder) / "warm.model"
                 atomic_save(exported, warm_path)
                 warm_args = parse_args(["--algorithm", "ppo", "--num-envs", "1", "--steps", "16",
@@ -2334,6 +2444,82 @@ def check_ppo(args):
     finally:
         env.close()
     print("PASS: PPO normalized-observation export, teacher load, mocked lifecycle/goal checks and checkpoint round trip. Optimizer steps: 0.")
+
+
+# Verify CAPG boundary mass, gradients and SB3 rollout/resume integration without training.
+def check_capg(args):
+    from unittest.mock import patch
+    means = torch.tensor([[.3, -.2, 1.4, -1.4]], dtype=torch.float64, requires_grad=True)
+    stds = torch.full_like(means, .7)
+    actions = torch.tensor([[-1., .1, 1., -4.]], dtype=torch.float64)
+    normal = torch.distributions.Normal(means, stds)
+    expected = normal.cdf(actions.new_tensor(-1.))[0, 0].log() + normal.log_prob(actions)[0, 1]
+    expected += (1 - normal.cdf(actions.new_tensor(1.)))[0, 2].log() + normal.cdf(actions.new_tensor(-1.))[0, 3].log()
+    actual = clipped_normal_log_prob(means, stds, actions)
+    torch.testing.assert_close(actual[0], expected)
+    actual.sum().backward()
+    assert torch.isfinite(means.grad).all()
+    torch.testing.assert_close(actual, clipped_normal_log_prob(means, stds, actions.clamp(-1., 1.)))
+    grid = torch.linspace(-1., 1., 10001, dtype=torch.float64)[:, None]
+    mass = torch.trapezoid(normal.log_prob(grid).exp(), grid[:, 0], dim=0)
+    mass += normal.cdf(grid[0])[0] + 1 - normal.cdf(grid[-1])[0]
+    torch.testing.assert_close(mass, torch.ones_like(mass), rtol=1e-7, atol=1e-7)
+
+    # For reward clip(a), the exact derivative with respect to its Gaussian mean is P(-1<a<1).
+    mu = torch.tensor(1.4, dtype=torch.float64, requires_grad=True)
+    sigma = .7
+    samples = mu.detach() + sigma * torch.randn(200000, generator=torch.Generator().manual_seed(23), dtype=torch.float64)
+    clipped = samples.clamp(-1., 1.)
+    log_prob = clipped_normal_log_prob(mu.expand(len(samples), 1), torch.full((len(samples), 1), sigma, dtype=torch.float64), clipped[:, None])
+    gradient = torch.autograd.grad((log_prob * clipped).mean(), mu)[0]
+    gaussian = torch.distributions.Normal(mu.detach(), sigma)
+    exact = gaussian.cdf(torch.tensor(1.)) - gaussian.cdf(torch.tensor(-1.))
+    assert abs(float(gradient - exact)) < .006
+    a, b = (-1 - mu.detach()) / sigma, (1 - mu.detach()) / sigma
+    log_phi = lambda value: -.5 * value.square() - .5 * math.log(2 * math.pi)
+    score = torch.where(samples <= -1, -(log_phi(a) - torch.special.log_ndtr(a)).exp() / sigma,
+                        torch.where(samples >= 1, (log_phi(b) - torch.special.log_ndtr(-b)).exp() / sigma,
+                                    (samples - mu.detach()) / sigma**2))
+    raw_estimator = clipped * (samples - mu.detach()) / sigma**2
+    assert (clipped * score).var() < raw_estimator.var()
+    extremes = torch.tensor([[-20., 0., 20.]], requires_grad=True)
+    entropy = clipped_normal_entropy(extremes, torch.full_like(extremes, .1))
+    entropy.backward()
+    assert torch.isfinite(entropy).all() and torch.isfinite(extremes.grad).all()
+
+    PPO, _, _, DummyVecEnv, _, VecNormalize = ppo_dependencies()
+    env = VecNormalize(DummyVecEnv([make_ppo_env]), norm_obs=True, norm_reward=False)
+    try:
+        with tempfile.TemporaryDirectory() as folder, patch.object(torch.optim.Adam, "step", side_effect=AssertionError("No optimizer steps in checks")):
+            model = PPO("MlpPolicy", env, seed=123, n_steps=8, batch_size=8,
+                        policy_kwargs={"activation_fn": nn.Tanh, "net_arch": {"pi": [256, 256], "vf": [256, 256]}})
+            with torch.no_grad():
+                model.policy.action_net.bias.fill_(1.4)  # Make clipping common in this untrained test fixture.
+            configure_ppo_distribution(model, True)
+            _, callback = model._setup_learn(8, callback=lambda local, global_: True)
+            assert model.collect_rollouts(env, callback, model.rollout_buffer, n_rollout_steps=8)
+            data = next(model.rollout_buffer.get(8))
+            assert bool(torch.any(data.actions == 1.)) and bool(torch.all(data.actions.abs() <= 1.))
+            _, logp, _ = model.policy.evaluate_actions(data.observations, data.actions)
+            torch.testing.assert_close(logp, data.old_log_prob, atol=1e-6, rtol=1e-6)
+            exported = export_ppo_agent(model, env)
+            state = env.get_original_obs()[0]
+            prediction, _ = model.predict(env.normalize_obs(state), deterministic=True)
+            np.testing.assert_allclose(exported.select_action(state, eval=True), prediction, atol=1e-6)
+            check_fresh_process(exported, folder)
+            options = parse_args(["--algorithm", "ppo", "--ppo-capg", "--num-envs", "1"])
+            checkpoint = Path(folder) / "checkpoint.pt"
+            save_ppo_checkpoint(model, env, options, exported.__getstate__(), 0., False, checkpoint)
+            saved = read_ppo_checkpoint(checkpoint)
+            assert saved["config"]["ppo_capg"]
+            restored = PPO.load(io.BytesIO(saved["model_zip"].numpy().tobytes()), env=env, device="cpu")
+            configure_ppo_distribution(restored, saved["config"]["ppo_capg"])
+            _, restored_logp, _ = restored.policy.evaluate_actions(data.observations, data.actions)
+            torch.testing.assert_close(restored_logp, logp)
+            assert optimizer_step_count(restored) == 0
+    finally:
+        env.close()
+    print("PASS: CAPG tail probabilities, unbiased-gradient example, reduced variance, entropy, real rollout log ratios and checkpoint/teacher load. Optimizer steps: 0.")
 
 
 # Verify exploration exports and training-only terrain replay with zero optimizer steps.
@@ -2439,9 +2625,10 @@ def check_campaign():
         atomic_save({"kind": "ppo_training_checkpoint", "format_version": FORMAT_VERSION, "steps": 8,
                      "config": baseline_config}, baseline["checkpoint"])
         commands = []
-        scores = {"pilot-gaussian": (184.85, 0.), "pilot-sde": (179.43, .05),
-                  "replicate-gaussian": (150., 0.), "replicate-sde": (175., .05),
-                  "continue-004-sde-coverage": (310., .9)}
+        scores = {"pilot-gaussian": (184.85, 0.), "pilot-capg": (179.43, .05),
+                  "replicate-gaussian": (150., 0.), "replicate-capg": (190., .05),
+                  "continue-002-capg-coverage": (200., .15),
+                  "continue-004-capg-coverage": (310., .9)}
 
         def result_for(name, seeds=None):
             reward, success = scores.get(name, (130., 0.))
@@ -2480,17 +2667,20 @@ def check_campaign():
                 contextlib.redirect_stdout(io.StringIO()):
             campaign = make_campaign("success")
             champion, reason = campaign_search(campaign, baseline)
-            assert reason == "development_target_reached" and champion["name"] == "continue-004-sde-coverage"
+            assert reason == "development_target_reached" and champion["name"] == "continue-004-capg-coverage"
             assert len(commands) == 8 and campaign_spent(campaign.manifest) == 128
-            assert commands[0].init_checkpoint and not commands[0].ppo_use_sde
-            assert commands[1].warm_start and commands[1].ppo_use_sde and commands[1].freeze_obs_stats
+            assert commands[0].init_checkpoint and not commands[0].ppo_capg
+            assert all(c.entropy_start == c.entropy_end == 0. for c in commands)
+            assert all(c.ppo_gae_lambda == .98 for c in commands)
+            assert campaign.manifest["allocation_decision"]["profile"] == "capg"
+            assert commands[1].init_checkpoint and commands[1].ppo_capg and commands[1].freeze_obs_stats
             assert commands[2].seed == commands[3].seed == spec["replication_seed"]
             assert commands[6].init_checkpoint and commands[7].init_checkpoint
             assert commands[7].ppo_learning_rate <= commands[1].ppo_learning_rate
             repeated, _ = campaign_search(campaign, baseline)
             assert repeated == champion and len(commands) == 8
             # The old score-only ranking would discard this rare-finishing policy.
-            first, second = [campaign.manifest["stages"][n]["candidate"] for n in ("pilot-gaussian", "pilot-sde")]
+            first, second = [campaign.manifest["stages"][n]["candidate"] for n in ("pilot-gaussian", "pilot-capg")]
             assert len(pareto_candidates([first, second])) == 2
             assert choose_candidate([first, second], baseline, spec, coverage=True) == second
             assert choose_candidate([first, second], baseline, spec, coverage=False) == first
@@ -2520,11 +2710,21 @@ def check_campaign():
                 with zipfile.ZipFile(campaign.root / "submission.zip") as archive:
                     assert set(archive.namelist()) == {"train.py", "a2c.model"}
 
-            # A reward plateau consumes only the declared budget, while both routes remain available.
-            scores.pop("continue-004-sde-coverage")
+            # A plateau terminates after three unproductive continuations instead of repeatedly restarting an old best.
+            scores.pop("continue-004-capg-coverage")
             stalled = make_campaign("stalled")
             _, reason = campaign_search(stalled, baseline)
-            assert reason == "budget_exhausted" and campaign_spent(stalled.manifest) == spec["budget"]
+            assert reason == "development_plateau" and campaign_spent(stalled.manifest) == 144
+            budgeted = make_campaign("budgeted")
+            budgeted.spec["budget"] = 80
+            assert campaign_search(budgeted, baseline)[1] == "budget_exhausted"
+            assert campaign_spent(budgeted.manifest) == 80
+            saved_scores = dict(scores)
+            scores.clear()
+            scores.update({name: (-100., 0.) for name in saved_scores})
+            assert campaign_search(make_campaign("regressed"), baseline)[1] == "no_replicated_admissible_profile"
+            scores.clear()
+            scores.update(saved_scores)
             assert all(s["steps"] + s["lost_steps_upper_bound"] <= s["allocation"] for s in stalled.manifest["stages"].values())
 
             # Recover a clean interruption without charging its unspent budget twice.
@@ -2596,6 +2796,8 @@ def parse_args(argv=None):
     parser.add_argument("--ppo-target-kl", type=float, default=0.02)
     parser.add_argument("--ppo-epochs", type=int, default=10)
     parser.add_argument("--ppo-use-sde", action="store_true", help="Use SB3 generalized state-dependent exploration during PPO collection.")
+    parser.add_argument("--ppo-capg", action="store_true", help="Optimize the clipped-action distribution using CAPG probabilities.")
+    parser.add_argument("--ppo-gae-lambda", type=float, default=.95)
     parser.add_argument("--sde-sample-freq", type=int, default=4)
     parser.add_argument("--entropy-start", type=float, default=.001)
     parser.add_argument("--entropy-end", type=float, default=.001)
@@ -2608,11 +2810,11 @@ def parse_args(argv=None):
     parser.add_argument("--run-dir", help="Fixed PPO stage directory; use --resume when it already contains a run.")
     parser.add_argument("--stop-file", help="Stop PPO at the next complete update boundary when this file exists.")
     parser.add_argument("--defer-confirmation", action="store_true", help="Campaign stage: keep confirmation and example seeds unused.")
-    parser.add_argument("--campaign-dir", default="runs/campaign-issue3-v4")
-    parser.add_argument("--campaign-baseline", help="Optional local copy of the pinned Issue #3 model; otherwise download it.")
-    parser.add_argument("--campaign-checkpoint", help="Optional local copy of the pinned Issue #3 full checkpoint.")
-    parser.add_argument("--campaign-budget", type=int, default=100_000_000)
-    parser.add_argument("--pilot-steps", type=int, default=10_000_000)
+    parser.add_argument("--campaign-dir", default="runs/campaign-issue4-v5")
+    parser.add_argument("--campaign-baseline", help="Optional local copy of the pinned Issue #4 model; otherwise download it.")
+    parser.add_argument("--campaign-checkpoint", help="Optional local copy of the pinned Issue #4 full checkpoint.")
+    parser.add_argument("--campaign-budget", type=int, default=60_000_000)
+    parser.add_argument("--pilot-steps", type=int, default=5_000_000)
     parser.add_argument("--chunk-steps", type=int, default=5_000_000)
     parser.add_argument("--dry-run", action="store_true", help="Print the campaign protocol without training, downloading or writing files.")
     parser.add_argument("--target-reward", type=float, default=300.0)
@@ -2649,7 +2851,7 @@ def parse_args(argv=None):
         args.ppo_batch_size = 256
         args.validation_seeds = CAMPAIGN_VALIDATION_SEEDS.copy()
         for flag, name, value in (("--confirmation-seeds", "confirmation_seeds", CAMPAIGN_CONFIRMATION_SEEDS.copy()),
-                                  ("--target-success", "target_success", .8), ("--seed", "seed", 9873)):
+                                  ("--target-success", "target_success", .8), ("--seed", "seed", 19873)):
             if not any(x == flag or x.startswith(flag + "=") for x in provided):
                 setattr(args, name, value)
     for name in ("num_envs", "torch_threads", "steps", "batch_size", "hidden_dim", "eval_freq", "save_freq", "log_interval", "return_steps"):
@@ -2675,7 +2877,11 @@ def parse_args(argv=None):
         parser.error("--dry-run is only valid with --mode campaign.")
     if args.render and args.mode != "eval":
         parser.error("--render is only valid in evaluation mode.")
+    if args.ppo_capg and args.algorithm != "ppo":
+        parser.error("--ppo-capg requires --algorithm ppo.")
     if args.algorithm == "ppo":
+        if not 0 <= args.ppo_gae_lambda <= 1 or (args.ppo_capg and args.ppo_use_sde):
+            parser.error("GAE lambda must be in [0, 1]; CAPG and gSDE cannot be combined.")
         if not (0 <= args.entropy_end <= args.entropy_start < 1 and 0 < args.target_success <= 1
                 and 0 <= args.terrain_replay_fraction <= .5 and args.sde_sample_freq > 0):
             parser.error("Invalid entropy schedule, success threshold, terrain replay fraction (0..0.5) or SDE frequency.")
@@ -2735,6 +2941,7 @@ def main(argv=None):
         run_checks(args)
         if args.algorithm == "ppo":
             check_ppo(args)
+            check_capg(args)
             check_exploration(args)
             check_campaign()
     elif args.mode == "benchmark":

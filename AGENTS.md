@@ -1,40 +1,39 @@
 # Agent handoff
 
-Read README.md first. The current authorized implementation is the Issue #3
-campaign (protocol version 2, directory runs/campaign-issue3-v4): Gaussian PPO
-and gSDE PPO from the pinned Issue #3 release, two independent training seeds per
-profile, bounded failed-terrain replay, separate complete reward/coverage
-checkpoints, then alternating continuation routes within 100M total new steps.
-Use --mode campaign on the target Windows computer when instructed to train.
-Do not start the old Issue #2 protocol, reuse its directory, or silently increase
-the budget. The source hash and protocol must remain unchanged during a run.
+Read README.md first. The current implementation is the Issue #4 campaign
+(protocol version 3, directory runs/campaign-issue4-v5). It imports the pinned
+interrupted-run best model and full optimizer checkpoint. Compare ordinary PPO
+and CAPG PPO on two independent training seeds, then continue the better method's
+reward/coverage leaders within 60M new interactions. Stop after three unproductive
+continuation stages. The program manages the allocation; do not extend it silently.
 
-Reuse GWTower's validated Python environment. No new dependency is introduced;
-install only missing packages, never routinely reinstall PyTorch. Preserve the
-original rewards, observations and exact 1600-step Hardcore environment. Training
-terrain seeds must not overlap development or final seeds. Keep at least 75%
-fresh terrain resets and the bounded retry queue in the default protocol.
+Keep the interrupted v2 directory and source commit 13fb52b intact. That run did
+not complete its final holdout. Never resume it using the new source. The new
+protocol requires a new directory; reuse the existing validated Python environment
+and install only missing packages. CAPG adds no dependencies. Do not reinstall
+PyTorch, add TensorFlow, or repeat setup on GWTower's already configured machine.
 
-Never train on the user's Mac. Only read-only evaluation, --dry-run and zero-update
-checks are allowed there. Reading/editing the repository alone is not a request
-to train. Do not call a real learner or optimizer.step during local validation;
-tests use synthetic outcomes and mocked learners with Adam.step blocked.
+Preserve original rewards, observations, Hardcore physics, the 1600-step limit,
+and stateless Agent.select_action(state, eval=True). CAPG changes the training
+log-probability at clipped action bounds; Gaussian raw-action gradients remain a
+valid comparator. Do not change only one side of the rollout/update likelihoods.
+Keep CAPG configuration and GAE lambda consistent after checkpoint restoration.
 
-On Windows, follow the campaign through evaluation and packaging. Check live
-processes before updating/resuming, preserve prior runs, and follow the README
-for safe interrupts. Report completed-update steps separately from discarded-step
-upper bounds. The final 100 seeds stay unread until final-choice.json is frozen;
-a disappointing holdout must not trigger reselection or further training.
+Never train on the user's Mac. Only zero-optimizer-update checks, dry-run and
+read-only evaluation are allowed. Use mocked learners for lifecycle checks and
+block Adam.step. Formal training occurs only on the target Windows computer.
+Do not claim a score improvement from software checks or from incomparable seed
+sets. The latest release's 203.47 is a validation mean, not a final-test result.
 
-Report coverage_goal_reached (>=80% finish), reward_goal_reached (raw mean >=300),
-and their conjunction goal_reached separately. These apply independently to both
-development groups and final confirmation. Report strict_300_all_finished too.
-The five historical example seeds are demonstrations, not a fresh test set.
-A completed campaign with unmet goals still exits 0; an interruption exits 130.
-Do not publish new trained models or logs without the user's explicit request.
+On Windows, inspect live processes before updating or resuming, preserve old
+runs, and follow the README through final packaging. Keep the new final 100
+seeds unused until final-choice.json is frozen. Do not use their results to
+reselect models or continue training. Report coverage (>=80%), raw mean (>=300),
+their conjunction, and strict all-finished/300 results separately. Include failure
+reasons, saturated-action fraction and finished-episode returns in diagnostics.
 
-Keep the single train.py deliverable, portable CPU Agent object and stateless
-teacher Agent.select_action(state, eval=True) API. Preserve the A2C baseline.
-Use English comments, standalone module comments and two blank lines between
-complete modules. Cite external algorithms and distinguish literature results
-from this project's measurements. Run the non-training checks after source edits.
+A completed run with unmet goals exits 0; a safe interruption exits 130. Report
+completed-update steps separately from crash loss bounds. Do not publish newly
+trained models or logs without an explicit user request. Preserve the single
+train.py deliverable and legacy A2C/gSDE loading paths, English standalone
+comments, and two blank lines between complete modules. Cite algorithm sources.
